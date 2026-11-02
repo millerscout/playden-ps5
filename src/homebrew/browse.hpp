@@ -36,6 +36,10 @@ struct ShelfWindow {
 };
 
 [[nodiscard]] std::vector<const Game*> filtered_games(const State& state);
+// Scope, install, hidden, demo, family, free, and compatibility. Query and store tags are separate.
+[[nodiscard]] bool LibraryScopeAllows(const State& state, const Game& game);
+// The library grid's order. Equal keys compare false both ways; the grid keeps catalog order among them.
+[[nodiscard]] bool LibrarySortBefore(const State& state, const Game& left, const Game& right);
 [[nodiscard]] std::vector<Shelf> shelves(const State& state);
 [[nodiscard]] ShelfWindow shelf_window(int item_count, int focused_item,
                                        int capacity = 7) noexcept;
