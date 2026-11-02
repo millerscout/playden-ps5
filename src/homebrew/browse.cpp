@@ -99,6 +99,65 @@ void select_game(State& state, GameId id, int index)
 
 } // namespace
 
+bool LibraryScopeAllows(const State& state, const Game& game)
+{
+    if (state.library.scope == "installed" && !installed(state, game.id))
+        return false;
+    if (state.library.scope == "favorites" && !state.library.favorites.contains(game.id))
+        return false;
+    if (state.library.scope == "hidden" && !state.library.hidden.contains(game.id))
+        return false;
+    if (state.library.scope == "imported" && game.id.store != Store::kLocal)
+        return false;
+    if (const Collection* collection = selected_collection(state);
+        collection != nullptr && !collection->members.contains(game.id))
+        return false;
+    if (state.library.scope != "hidden" && state.library.hidden.contains(game.id))
+        return false;
+    if (state.library.filters.contains("installed") && !installed(state, game.id))
+        return false;
+    if (state.library.filters.contains("hide-demos") && game.demo)
+        return false;
+    if (state.library.filters.contains("hide-family") && game.family_shared)
+        return false;
+    if (game.free && !state.library.filters.contains("free"))
+        return false;
+    if (state.library.filters.contains("compat-playable"))
+    {
+        const auto rating = state.library.ratings.find(game.id);
+        if (rating == state.library.ratings.end() ||
+            (rating->second != Compatibility::Playable && rating->second != Compatibility::Works))
+            return false;
+    }
+    return true;
+}
+
+bool LibrarySortBefore(const State& state, const Game& left, const Game& right)
+{
+    const auto& sort = state.library.view_sort.empty() ? state.library.sort : state.library.view_sort;
+    if (sort == "name")
+    {
+        if (!state.simulation_mode)
+        {
+            if (!left.folded_title.empty() && !right.folded_title.empty())
+                return left.folded_title == right.folded_title ? left.id < right.id : left.folded_title < right.folded_title;
+            const std::string a = left.folded_title.empty() ? FoldLibraryText(left.title) : left.folded_title;
+            const std::string b = right.folded_title.empty() ? FoldLibraryText(right.title) : right.folded_title;
+            return a == b ? left.id < right.id : a < b;
+        }
+        return ascii_lower(left.title) < ascii_lower(right.title);
+    }
+    if (sort == "recent-played")
+        return optional_descending(left.last_played, right.last_played);
+    if (sort == "recent-added")
+        return optional_descending(left.added_at, right.added_at);
+    if (sort == "playtime")
+        return optional_descending(left.playtime_minutes, right.playtime_minutes);
+    if (sort == "install-size")
+        return optional_descending(left.install_bytes, right.install_bytes);
+    return false;
+}
+
 std::vector<const Game*> filtered_games(const State& state)
 {
     std::vector<const Game*> result;
@@ -114,20 +173,9 @@ std::vector<const Game*> filtered_games(const State& state)
     const auto folded_title=[&](const Game& game)->const std::string& {
         return game.folded_title.empty() ? folded_titles.at(game.id) : game.folded_title;
     };
-    const Collection* collection = selected_collection(state);
     for (const Game& game : state.games)
     {
-        if (state.library.scope == "installed" && !installed(state, game.id))
-            continue;
-        if (state.library.scope == "favorites" && !state.library.favorites.contains(game.id))
-            continue;
-        if (state.library.scope == "hidden" && !state.library.hidden.contains(game.id))
-            continue;
-        if (state.library.scope == "imported" && game.id.store != Store::kLocal)
-            continue;
-        if (collection != nullptr && !collection->members.contains(game.id))
-            continue;
-        if (state.library.scope != "hidden" && state.library.hidden.contains(game.id))
+        if (!LibraryScopeAllows(state, game))
             continue;
         if (!query.empty()) {
             const bool matches=state.simulation_mode
@@ -165,64 +213,20 @@ std::vector<const Game*> filtered_games(const State& state)
             }
             if (!matches_every) continue;
         }
-        if (state.library.filters.contains("installed") && !installed(state, game.id))
-            continue;
-        // Demos show unless the player hides them, so the stored filter is the hiding one.
-        if (state.library.filters.contains("hide-demos") && game.demo)
-            continue;
-        if (state.library.filters.contains("hide-family") && game.family_shared)
-            continue;
-        // License-only free games stay out of the grid until the player turns Free games on.
-        if (game.free && !state.library.filters.contains("free"))
-            continue;
         if (state.library.filters.contains("genre-adventure") &&
             std::find(game.genres.begin(), game.genres.end(), "Adventure") == game.genres.end())
             continue;
         if (state.library.filters.contains("controller-full") && game.controller_support != "full")
             continue;
-        if (state.library.filters.contains("compat-playable"))
-        {
-            const auto rating = state.library.ratings.find(game.id);
-            if (rating == state.library.ratings.end() ||
-                (rating->second != Compatibility::Playable && rating->second != Compatibility::Works))
-                continue;
-        }
         result.push_back(&game);
     }
 
     const auto& sort = state.library.view_sort.empty() ? state.library.sort : state.library.view_sort;
-    if (sort == "name")
+    if (sort == "name" || sort == "recent-played" || sort == "recent-added" || sort == "playtime" ||
+        sort == "install-size")
     {
         std::stable_sort(result.begin(), result.end(), [&](const Game* left, const Game* right) {
-            if(!state.simulation_mode) {
-                const auto& a=folded_title(*left);const auto& b=folded_title(*right);
-                return a==b ? left->id<right->id : a<b;
-            }
-            return ascii_lower(left->title) < ascii_lower(right->title);
-        });
-    }
-    else if (sort == "recent-played")
-    {
-        std::stable_sort(result.begin(), result.end(), [](const Game* left, const Game* right) {
-            return optional_descending(left->last_played, right->last_played);
-        });
-    }
-    else if (sort == "recent-added")
-    {
-        std::stable_sort(result.begin(), result.end(), [](const Game* left, const Game* right) {
-            return optional_descending(left->added_at, right->added_at);
-        });
-    }
-    else if (sort == "playtime")
-    {
-        std::stable_sort(result.begin(), result.end(), [](const Game* left, const Game* right) {
-            return optional_descending(left->playtime_minutes, right->playtime_minutes);
-        });
-    }
-    else if (sort == "install-size")
-    {
-        std::stable_sort(result.begin(), result.end(), [](const Game* left, const Game* right) {
-            return optional_descending(left->install_bytes, right->install_bytes);
+            return LibrarySortBefore(state, *left, *right);
         });
     }
     return result;
