@@ -1335,14 +1335,17 @@ PackageCache LoadPackageCache(const Storage& storage) {
     package.borrowed = reader.Number(4) & 1u;
     package.time_created = static_cast<std::uint32_t>(reader.Number(4));
     const auto apps = reader.Number(4);
-    if (!reader.okay || !id || apps > kMaxCachedIds) return {};
+    if (!reader.okay || apps > kMaxCachedIds) return {};
     package.contents.app_ids.resize(static_cast<std::size_t>(apps));
     for (auto& app : package.contents.app_ids) app = static_cast<std::uint32_t>(reader.Number(4));
     const auto depots = reader.Number(4);
     if (!reader.okay || depots > kMaxCachedIds) return {};
     package.contents.depot_ids.resize(static_cast<std::size_t>(depots));
     for (auto& depot : package.contents.depot_ids) depot = static_cast<std::uint32_t>(reader.Number(4));
-    if (!reader.okay || !cache.packages.emplace(id, std::move(package)).second) return {};
+    if (!reader.okay) return {};
+    // Package 0 is not a saved grant. An older file stores it first, and rejecting that id dropped every package.
+    if (id == 0) continue;
+    if (!cache.packages.emplace(id, std::move(package)).second) return {};
   }
   if (!reader.okay || reader.offset != body) return {};
   return cache;
@@ -1358,8 +1361,12 @@ bool SavePackageCache(const Storage& storage, const PackageCache& cache) {
   AppendPackageNumber(out, cache.current_change_number, 4);
   AppendPackageNumber(out, cache.fetched_at, 8);
   AppendPackageNumber(out, cache.license_changes, 8);
-  AppendPackageNumber(out, cache.packages.size(), 4);
+  std::size_t saved = 0;
+  for (const auto& [id, package] : cache.packages)
+    if (id != 0) ++saved;
+  AppendPackageNumber(out, saved, 4);
   for (const auto& [id, package] : cache.packages) {
+    if (id == 0) continue;
     if (package.contents.app_ids.size() > kMaxCachedIds || package.contents.depot_ids.size() > kMaxCachedIds) return false;
     const std::size_t entry =
         4 + 4 + 4 + 4 + 4 + package.contents.app_ids.size() * 4 + 4 + package.contents.depot_ids.size() * 4;
