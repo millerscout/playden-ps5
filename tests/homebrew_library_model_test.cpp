@@ -2510,6 +2510,123 @@ void live_store_tag_filter_from_details() {
     check(model.visible_games().size() == 2, "Adventure tag matches both games");
 }
 
+void store_browse_keeps_the_index_until_filter_membership_changes() {
+    auto model = make_live();
+    model.UpdateAccount({AuthState::SignedIn, "123", "Synthetic", {}, {}, true});
+    check(model.UpdateLibrary({{game(SteamId(42), "Alpha"), game(SteamId(43), "Beta"), game(SteamId(44), "Zebra")},
+                               false, {}, false, false, {}}),
+          "store browse: library loaded");
+    check(model.action("r1"), "store browse: library open");
+    auto organization = model.ExportOrganization();
+    auto apply = [&](const char* message) {
+        check(model.ApplyOrganization(1, model.BeginOrganizationLoad(1), organization), message);
+    };
+    auto browse = [&](playden::homebrew::Simulation::StoreBrowseUpdate update) {
+        model.UpdateStoreBrowse({std::move(update)});
+    };
+    auto only = [&](playden::GameId id) {
+        const auto visible = model.visible_games();
+        return visible.size() == 1 && visible.front()->id == id;
+    };
+    organization.tag_filters = {"Roguelike"};
+    apply("tag filter applies");
+    check(model.visible_games().empty(), "untagged games stay out of a tag filter");
+
+    playden::homebrew::Simulation::StoreBrowseUpdate update;
+    update.id = SteamId(42);
+    update.tags_known = true;
+    update.tags = {"Roguelike"};
+    browse(update);
+    check(only(SteamId(42)), "a tag that starts matching enters the library");
+    update.tags = {"Roguelike", "Indie"};
+    browse(update);
+    check(only(SteamId(42)) && find_game(model, SteamId(42))->store_tags.size() == 2,
+          "another tag on a game that still matches leaves the index");
+    update.tags = {"Indie"};
+    browse(update);
+    check(model.visible_games().empty(), "losing the filtered tag leaves the library");
+
+    organization.tag_filters.clear();
+    organization.query = "roguelike";
+    apply("search applies");
+    update.tags = {"Roguelike"};
+    browse(update);
+    check(only(SteamId(42)), "a store tag can satisfy the library search");
+    update.tags = {"Indie"};
+    browse(update);
+    check(model.visible_games().empty(), "a tag that no longer matches the search leaves it");
+
+    organization.tag_filters = {"Roguelike"};
+    organization.query.clear();
+    apply("tag filter returns");
+    update.id = SteamId(44);
+    update.tags = {"Roguelike"};
+    browse(update);
+    check(only(SteamId(44)) && model.state().navigation.selected_game_id == SteamId(44) &&
+              model.state().navigation.selected_index == 0,
+          "the game that enters an empty filter becomes the selection");
+    update.id = SteamId(42);
+    update.tags = {"Roguelike"};
+    browse(update);
+    const auto ordered = model.visible_games();
+    check(ordered.size() == 2 && ordered[0]->id == SteamId(42) && ordered[1]->id == SteamId(44),
+          "a game that starts matching is inserted in name order");
+    check(model.state().navigation.selected_game_id == SteamId(44) && model.state().navigation.selected_index == 1,
+          "the selected game stays selected when an earlier game enters");
+
+    organization.hidden = {SteamId(43)};
+    apply("a hidden game is recorded");
+    update.id = SteamId(43);
+    update.tags = {"Roguelike"};
+    browse(update);
+    const auto after_hidden = model.visible_games();
+    check(after_hidden.size() == 2 && after_hidden[0]->id == SteamId(42) && after_hidden[1]->id == SteamId(44),
+          "a hidden game stays out when its tag starts matching");
+
+    update.id = SteamId(42);
+    update.tags = {"Indie"};
+    browse(update);
+    update.id = SteamId(44);
+    update.tags = {"Indie"};
+    browse(update);
+    check(model.visible_games().empty() && !model.state().navigation.selected_game_id.valid() &&
+              model.state().navigation.focus_key == "library-empty",
+          "the last game to leave clears the highlight");
+
+    auto dated = make_live();
+    dated.UpdateAccount({AuthState::SignedIn, "123", "Synthetic", {}, {}, true});
+    auto first = game(SteamId(42), "Alpha");
+    auto middle = game(SteamId(43), "Mid");
+    auto last = game(SteamId(44), "Zebra");
+    first.last_played_unix_seconds = 100;
+    middle.last_played_unix_seconds = 100;
+    last.last_played_unix_seconds = 100;
+    check(dated.UpdateLibrary({{first, middle, last}, false, {}, false, false, {}}), "equal play dates loaded");
+    check(dated.action("r1"), "equal play dates: library open");
+    auto dated_organization = dated.ExportOrganization();
+    dated_organization.sort = "recent-played";
+    dated_organization.tag_filters = {"Roguelike"};
+    check(dated.ApplyOrganization(1, dated.BeginOrganizationLoad(1), dated_organization), "recent played sort applies");
+    playden::homebrew::Simulation::StoreBrowseUpdate earlier;
+    earlier.id = SteamId(42);
+    earlier.tags_known = true;
+    earlier.tags = {"Roguelike"};
+    playden::homebrew::Simulation::StoreBrowseUpdate later = earlier;
+    later.id = SteamId(44);
+    dated.UpdateStoreBrowse({earlier, later});
+    check(dated.action("right") && dated.state().navigation.selected_game_id == SteamId(44),
+          "the later equal game is selected");
+    playden::homebrew::Simulation::StoreBrowseUpdate between = earlier;
+    between.id = SteamId(43);
+    dated.UpdateStoreBrowse({between});
+    const auto played = dated.visible_games();
+    check(played.size() == 3 && played[0]->id == SteamId(42) && played[1]->id == SteamId(43) &&
+              played[2]->id == SteamId(44),
+          "an equal play date keeps catalog order");
+    check(dated.state().navigation.selected_game_id == SteamId(44) && dated.state().navigation.selected_index == 2,
+          "the selected game stays selected when an equal game sorts earlier");
+}
+
 void r3_opens_the_tag_sheet_from_a_poster() {
     auto model = make_live();
     model.UpdateAccount({AuthState::SignedIn, "123", "Synthetic", {}, {}, true});
@@ -4391,6 +4508,7 @@ int main() {
     description_pages_break_on_words();
     trailer_cross_starts_and_stops();
     live_store_tag_filter_from_details();
+    store_browse_keeps_the_index_until_filter_membership_changes();
     r3_opens_the_tag_sheet_from_a_poster();
     live_detail_genres_open_and_more_tags_list_the_rest();
     live_ready_to_play_quits_to_home();

@@ -3523,7 +3523,58 @@ bool Simulation::UpdateStoreTags(GameId id, std::vector<std::string> tags) {
 
 void Simulation::UpdateStoreBrowse(std::vector<StoreBrowseUpdate> updates) {
     if (!live() || updates.empty()) return;
+    const bool searching = state_.editor.active && state_.editor.purpose == "Search";
+    const std::string& raw_query = searching ? state_.editor.value : state_.library.query;
+    auto fold = [this](const std::string& value) {
+        if (!state_.simulation_mode) return FoldLibraryText(value);
+        std::string lower = value;
+        for (char& character : lower)
+            if (character >= 'A' && character <= 'Z') character = static_cast<char>(character - 'A' + 'a');
+        return lower;
+    };
+    const std::string folded_query = fold(raw_query);
+    std::vector<std::string> folded_filters;
+    folded_filters.reserve(state_.library.tag_filters.size());
+    for (const auto& filter : state_.library.tag_filters) folded_filters.push_back(fold(filter));
+    const bool want_adventure = state_.library.filters.contains("genre-adventure");
+    const bool want_controller = state_.library.filters.contains("controller-full");
+    const bool watch = !folded_query.empty() || !folded_filters.empty() || want_adventure || want_controller;
+    const bool spliceable = library_index_current();
+    // The same gates filtered_games uses for store data. Scope and install state do not change here.
+    auto matches = [&](const Game& game) {
+        if (!folded_query.empty()) {
+            const std::string title = !state_.simulation_mode && !game.folded_title.empty() ? game.folded_title : fold(game.title);
+            bool hit = title.find(folded_query) != std::string::npos;
+            if (!hit)
+                for (const auto& tag : game.store_tags)
+                    if (fold(tag).find(folded_query) != std::string::npos) {
+                        hit = true;
+                        break;
+                    }
+            if (!hit) return false;
+        }
+        if (!folded_filters.empty()) {
+            for (const auto& filter : folded_filters) {
+                const bool labelled =
+                    (game.store_tags_known && std::any_of(game.store_tags.begin(), game.store_tags.end(),
+                        [&](const std::string& tag) { return fold(tag) == filter; })) ||
+                    std::any_of(game.genres.begin(), game.genres.end(),
+                        [&](const std::string& genre) { return fold(genre) == filter; });
+                if (!labelled) return false;
+            }
+        }
+        if (want_adventure && std::find(game.genres.begin(), game.genres.end(), "Adventure") == game.genres.end())
+            return false;
+        if (want_controller && game.controller_support != "full") return false;
+        return true;
+    };
     std::vector<GameId> touched;
+    struct Membership {
+        GameId id;
+        bool before = false;
+        bool after = false;
+    };
+    std::vector<Membership> membership;
     for (auto& update : updates) {
         if (!update.id.valid() || update.tags.size() > 32 || update.screenshots.size() > 4) continue;
         if (update.trailer_thumbnail.size() > 512 || update.trailer_url.size() > 512 ||
@@ -3555,6 +3606,7 @@ void Simulation::UpdateStoreBrowse(std::vector<StoreBrowseUpdate> updates) {
         if (update.genres_known) facts.genres = std::move(update.genres);
         for (auto& game : state_.games) {
             if (game.id != update.id) continue;
+            const bool matched = watch && matches(game);
             if (update.tags_known) {
                 game.store_tags = facts.tags;
                 game.store_tags_known = true;
@@ -3570,18 +3622,44 @@ void Simulation::UpdateStoreBrowse(std::vector<StoreBrowseUpdate> updates) {
             if (!facts.description.empty()) game.description = facts.description;
             if (!facts.controller_support.empty()) game.controller_support = facts.controller_support;
             if (update.genres_known) game.genres = facts.genres;
+            const bool now = watch && matches(game);
+            auto recorded = std::find_if(membership.begin(), membership.end(),
+                                         [&](const Membership& item) { return item.id == update.id; });
+            if (recorded == membership.end()) membership.push_back({update.id, matched, now});
+            else recorded->after = now;
             touched.push_back(update.id);
         }
     }
-    const bool tags_matter = !state_.library.tag_filters.empty() || !state_.library.query.empty() ||
-                             state_.library.filters.contains("genre-adventure") ||
-                             state_.library.filters.contains("controller-full");
-    if (tags_matter && !touched.empty()) ++library_filter_epoch_;
+    std::vector<GameId> entered;
+    std::vector<GameId> left;
+    for (const auto& item : membership) {
+        if (item.before == item.after) continue;
+        if (item.after) entered.push_back(item.id);
+        else left.push_back(item.id);
+    }
+    const bool membership_changed = !entered.empty() || !left.empty();
+    if (membership_changed) {
+        ++library_filter_epoch_;
+        // The next visible_games() splices these. Anything else about the index still rebuilds it whole.
+        if (spliceable) {
+            library_index_entered_ = std::move(entered);
+            library_index_left_ = std::move(left);
+        } else {
+            library_index_entered_.clear();
+            library_index_left_.clear();
+        }
+    }
     if (touched.empty()) return;
+    if (membership_changed) {
+        (void)visible_games().size();
+        place_library_selection();
+        rebuild_view();
+        return;
+    }
     std::set<GameId> shown;
     const auto route = state_.navigation.route;
     if (route == Route::Library) {
-        const auto visible = visible_games();
+        const auto visible = cached_visible_games();
         if (!visible.empty()) {
             const std::size_t window = 24;
             const std::size_t selected = static_cast<std::size_t>(std::max(0, state_.navigation.selected_index));
@@ -5500,7 +5578,7 @@ bool Simulation::scenario(const std::string& name) {
     return true;
 }
 
-bool Simulation::library_index_current() const {
+bool Simulation::library_index_base_current() const {
     if (!library_index_valid_) return false;
     const bool searching = state_.editor.active && state_.editor.purpose == "Search";
     const std::string& query = searching ? state_.editor.value : state_.library.query;
@@ -5516,8 +5594,68 @@ bool Simulation::library_index_current() const {
            library_index_tags_ == state_.library.tag_filters && library_index_hidden_ == state_.library.hidden &&
            library_index_favorites_ == state_.library.favorites && library_index_members_ == members &&
            library_index_installs_ == installs && library_index_auth_ == auth &&
-           library_index_cache_ == state_.account().cache_available &&
-           library_index_epoch_ == library_filter_epoch_;
+           library_index_cache_ == state_.account().cache_available;
+}
+
+bool Simulation::library_index_current() const {
+    return library_index_base_current() && library_index_epoch_ == library_filter_epoch_;
+}
+
+bool Simulation::splice_library_index() const {
+    if (library_index_entered_.empty() && library_index_left_.empty()) return false;
+    if (state_.library.filters.contains("empty-fixture")) return false;
+    auto next = library_index_;
+    for (const GameId id : library_index_left_) {
+        const auto found = std::find_if(next.begin(), next.end(),
+                                         [id](const Game* game) { return game->id == id; });
+        if (found == next.end()) continue;
+        next.erase(found);
+    }
+    const auto less = [this](const Game* left, const Game* right) {
+        return LibrarySortBefore(state_, *left, *right);
+    };
+    for (const GameId id : library_index_entered_) {
+        if (std::any_of(next.begin(), next.end(), [id](const Game* game) { return game->id == id; }))
+            return false;
+        const Game* game = find_game(state_, id);
+        if (game == nullptr) return false;
+        if (!LibraryScopeAllows(state_, *game)) continue;
+        const auto lower = std::lower_bound(next.begin(), next.end(), game, less);
+        const auto upper = std::upper_bound(lower, next.end(), game, less);
+        const auto place = std::find_if(lower, upper, [game](const Game* existing) { return game < existing; });
+        next.insert(place, game);
+    }
+    library_index_ = std::move(next);
+    library_index_entered_.clear();
+    library_index_left_.clear();
+    return true;
+}
+
+void Simulation::place_library_selection() {
+    if (state_.navigation.route != Route::Library || state_.navigation.library_rail_focused) return;
+    std::size_t chip = 0;
+    const bool chip_focused = SelectedTagIndex(state_.navigation.focus_key, chip) &&
+                              chip < state_.library.tag_filters.size();
+    const bool keep_focus = chip_focused || state_.editor.active || !state_.navigation.modals.empty();
+    const auto& games = library_index_;
+    const auto current = std::find_if(games.begin(), games.end(), [this](const Game* game) {
+        return game->id == state_.navigation.selected_game_id;
+    });
+    if (current != games.end()) {
+        state_.navigation.selected_index = static_cast<int>(std::distance(games.begin(), current));
+        if (!keep_focus) state_.navigation.focus_key = game_key(state_.navigation.selected_game_id);
+    } else if (!games.empty()) {
+        state_.navigation.selected_index = std::clamp(state_.navigation.selected_index, 0,
+                                                      static_cast<int>(games.size()) - 1);
+        state_.navigation.selected_game_id = games[static_cast<std::size_t>(state_.navigation.selected_index)]->id;
+        if (!keep_focus) state_.navigation.focus_key = game_key(state_.navigation.selected_game_id);
+    } else {
+        state_.navigation.selected_index = 0;
+        state_.navigation.selected_game_id = {};
+        if (!keep_focus)
+            state_.navigation.focus_key = state_.library.query.empty() ? "library-empty" : "clear-search";
+    }
+    state_.navigation.scroll_offsets["library-grid"] = state_.navigation.selected_index / 6;
 }
 
 std::vector<const Game*> Simulation::cached_visible_games() const {
@@ -5527,6 +5665,12 @@ std::vector<const Game*> Simulation::cached_visible_games() const {
 
 std::vector<const Game*> Simulation::visible_games() const {
     if (library_index_current()) return library_index_;
+    if (library_index_base_current() && splice_library_index()) {
+        library_index_epoch_ = library_filter_epoch_;
+        return library_index_;
+    }
+    library_index_entered_.clear();
+    library_index_left_.clear();
     const bool searching = state_.editor.active && state_.editor.purpose == "Search";
     const std::string& query = searching ? state_.editor.value : state_.library.query;
     const auto& sort = state_.library.view_sort.empty() ? state_.library.sort : state_.library.view_sort;

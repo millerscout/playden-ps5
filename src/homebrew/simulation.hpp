@@ -1684,7 +1684,14 @@ private:
     [[nodiscard]] bool update_locked(GameId id) const;
 
     [[nodiscard]] bool library_index_current() const;
-    // visible_games() rebuilds this only when the catalog or the filters change.
+    // Same comparison as library_index_current(), without the membership epoch.
+    [[nodiscard]] bool library_index_base_current() const;
+    // Inserts and removes the recorded membership delta. False leaves the index untouched.
+    bool splice_library_index() const;
+    // Keeps the library highlight on the same game after that splice.
+    void place_library_selection();
+    // visible_games() rebuilds this when the catalog or the filters change.
+    // A recorded membership delta is spliced into the current order instead.
     mutable std::vector<const Game*> library_index_;
     mutable const Game* library_index_data_ = nullptr;
     mutable std::size_t library_index_size_ = 0;
@@ -1702,6 +1709,9 @@ private:
     mutable bool library_index_valid_ = false;
     std::uint64_t library_filter_epoch_ = 0;
     mutable std::uint64_t library_index_epoch_ = 0;
+    // Games that entered or left the filter since the index was built.
+    mutable std::vector<GameId> library_index_entered_;
+    mutable std::vector<GameId> library_index_left_;
 };
 
 } // namespace playden::homebrew
