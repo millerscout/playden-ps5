@@ -1610,6 +1610,21 @@ bool FilesystemPackageInstaller::SetupFromOtherKit(const RuntimeInstall& record)
   return other_kit(paths->title, kTitleOwner, "title") || other_kit(paths->bottle, kTemplateOwner, "template");
 }
 
+bool FilesystemPackageInstaller::CompatibleKitIdentity(const RuntimeInstall& record) {
+  const auto paths = Resolve(record);
+  if (!paths) return false;
+  const auto title_marker = ReadBounded(paths->title / kTitleOwner, 4096);
+  const auto bottle_marker = ReadBounded(paths->bottle / kTemplateOwner, 4096);
+  if (!title_marker || !bottle_marker) return false;
+  if (!MarkerIdentifies(paths->title / kTitleOwner, record, "title") ||
+      !MarkerIdentifies(paths->bottle / kTemplateOwner, record, "template"))
+    return false;
+  const auto new_title = OwnerMarker(record, kit_, "title");
+  const auto new_bottle = OwnerMarker(record, kit_, "template");
+  return RespinIdentity(new_title, kit_.kit_id) == RespinIdentity(*title_marker, kit_.kit_id) &&
+         RespinIdentity(new_bottle, kit_.kit_id) == RespinIdentity(*bottle_marker, kit_.kit_id);
+}
+
 PackageActionResult FilesystemPackageInstaller::RefreshTitle(const RuntimeInstall& record) {
   const auto paths = Resolve(record);
   if (!paths) return Failed("kit-invalid", "record or verified kit view is invalid");

@@ -1434,6 +1434,15 @@ int main(int argc, char** argv) {
   GameSettingsRecord loaded;
   CHECK(ParseGameSettingsRecord(SerializeGameSettingsRecord(record), &loaded, &reason));
   CHECK(loaded.preset_id == record.preset_id && loaded.overrides == record.overrides && loaded.revision == 7);
+  record.kit = "my-kit";
+  CHECK(ParseGameSettingsRecord(SerializeGameSettingsRecord(record), &loaded, &reason) && loaded.kit == "my-kit");
+  CHECK(ParseGameSettingsRecord(R"({"preset":"","revision":1,"overrides":{},"kit":"latest"})", &loaded, &reason) &&
+        loaded.kit == "latest");
+  CHECK(ParseGameSettingsRecord(R"({"preset":"","revision":1,"overrides":{},"kit":"a/b"})", &loaded, &reason) &&
+        loaded.kit.empty());
+  CHECK(ParseGameSettingsRecord(R"({"preset":"","revision":1,"overrides":{},"kit":".hidden"})", &loaded, &reason) &&
+        loaded.kit.empty());
+  record.kit.clear();
   for (const auto revision : {UINT64_C(9007199254740993), std::numeric_limits<std::uint64_t>::max()}) {
     record.revision = revision;
     const auto serialized = SerializeGameSettingsRecord(record);

@@ -109,6 +109,10 @@ int main() {
   CHECK(KitVersionFromArtifact("f729534-kit-0.13-dev.20261023.1")->development);
   CHECK(!KitVersionFromArtifact("bceed2d-kit-h-r1") && !KitVersionFromArtifact("f729534") &&
         !KitVersionFromArtifact("0.12"));
+  CHECK(ArtifactGitHash("abc-kit-0.16") == "abc" && ArtifactGitHash("f729534-kit-0.12") == "f729534");
+  CHECK(ArtifactGitHash("bceed2d-kit-h-r1") == "bceed2d");
+  CHECK(ArtifactGitHash("h-r9").empty() && ArtifactGitHash("AB-kit-0.16").empty() && ArtifactGitHash("").empty());
+  CHECK(!IsGitHash("ab") && IsGitHash(std::string(40, 'a')) && !IsGitHash(std::string(41, 'a')));
   std::puts("ok");
   return 0;
 }

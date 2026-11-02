@@ -1392,9 +1392,12 @@ void Controller::TickRuntime() {
     if (refusal != snapshot.refusals.end() && !game.ready) game.detail = refusal->second;
     // A setup left over from an earlier kit: what to do, not the check that failed (or the refusal saying so).
     if (record && record->setup_other_kit && usable &&
-        (game.status == "Needs recovery" || game.status == "Failed" || game.status == "Not prepared")) {
+        (game.status == "Needs recovery" || game.status == "Failed" || game.status == "Not prepared" ||
+         game.status == "Kit update available")) {
       game.setup_other_kit = true;
-      game.detail = "Started with an earlier kit · Recreate the bottle to finish (saves are kept)";
+      game.detail = game.status == "Kit update available"
+                        ? "This title was made from another kit. Recreate the bottle to use the chosen one (saves are kept)"
+                        : "Started with an earlier kit · Recreate the bottle to finish (saves are kept)";
     }
     if (const auto refused = snapshot.play_refusals.find(NumberIn(snapshot, id)); refused != snapshot.play_refusals.end())
       game.play_detail = "Could not start: " + refused->second;
@@ -1543,7 +1546,7 @@ void Controller::TickRuntime() {
   {
     std::vector<AdmittedKit> admitted;
     admitted.reserve(snapshot.admitted_kits.size());
-    for (const auto& held : snapshot.admitted_kits) admitted.push_back({held.version, held.latest_slot});
+    for (const auto& held : snapshot.admitted_kits) admitted.push_back({held.folder, held.latest_slot});
     model_.SetAdmittedKits(std::move(admitted));
   }
   announce_ready();

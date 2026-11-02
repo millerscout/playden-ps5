@@ -91,6 +91,10 @@ class RoutingPackageInstaller final : public rt::PackageInstaller {
     auto* chosen = pick_(record);
     return chosen && chosen->SetupFromOtherKit(record);
   }
+  bool CompatibleKitIdentity(const rt::RuntimeInstall& record) override {
+    auto* chosen = pick_(record);
+    return chosen && chosen->CompatibleKitIdentity(record);
+  }
   rt::PackageActionResult WriteTitleMetadata(const rt::RuntimeInstall& record, const std::string& param,
                                             const std::optional<std::string>& icon) override {
     return Choose(record).WriteTitleMetadata(record, param, icon);
@@ -368,7 +372,7 @@ struct RuntimeHost::Composition {
   struct HeldKit {
     RuntimeKit kit;
     bool latest_slot = false;
-    std::string version;
+    std::string folder;
     std::unique_ptr<rt::FilesystemPackageInstaller> installer;
   };
   std::vector<HeldKit> held;
@@ -768,20 +772,15 @@ const RuntimeKit* RuntimeHost::KitFor(const Composition& c, const rt::RuntimeIns
   }
   const std::string default_pin = config_.default_kit ? config_.default_kit() : std::string{};
   bool latest = false;
-  std::string latest_version;
   std::vector<std::string> parked;
   for (const auto& held : c.held) {
-    if (held.latest_slot) {
-      latest = true;
-      latest_version = held.version;
-    } else if (!held.version.empty()) {
-      parked.push_back(held.version);
-    }
+    if (held.latest_slot) latest = true;
+    else if (!held.folder.empty()) parked.push_back(held.folder);
   }
-  const auto resolved = rt::ResolveGameKit(game_pin, default_pin, latest, latest_version, parked);
+  const auto resolved = rt::ResolveGameKit(game_pin, default_pin, latest, parked);
   for (const auto& held : c.held) {
     if (resolved.kind == rt::ResolvedKitKind::kLatestSlot && held.latest_slot) return &held.kit;
-    if (resolved.kind == rt::ResolvedKitKind::kVersion && !held.latest_slot && held.version == resolved.version)
+    if (resolved.kind == rt::ResolvedKitKind::kFolder && !held.latest_slot && held.folder == resolved.folder)
       return &held.kit;
   }
   return nullptr;
@@ -1593,11 +1592,19 @@ void RuntimeHost::PublishInstalls(const Composition& composition, const std::str
     }
     if (const auto kept = checked.find(record.install_id); !only.empty() && record.install_id != only && kept != checked.end()) {
       std::tie(view.title_current, view.runtime_current, view.setup_other_kit) = kept->second;
-    } else if (record.state == rt::PreparationState::kReady && composition.kit) {
-      const bool files_current = composition.installer->TitleCurrent(record);
-      view.title_current = files_current && composition.installer->TitleMetadataCurrent(record) && TitleNameCurrent(record);
-      view.runtime_current = files_current && ArtifactsBound(composition.kit->view.artifacts, record);
-    } else if (composition.kit && SetupRestarts(record) && !view.moving) {
+    } else if (record.state == rt::PreparationState::kReady) {
+      // The kit this game is pinned to, not the default. A folder pin can admit when Latest did not.
+      const auto* game_kit = KitFor(composition, record);
+      if (game_kit && composition.installer) {
+        const bool files_current = composition.installer->TitleCurrent(record);
+        view.title_current = files_current && composition.installer->TitleMetadataCurrent(record) && TitleNameCurrent(record);
+        view.runtime_current = files_current && ArtifactsBound(game_kit->view.artifacts, record);
+        // A respin of this kit (new runtime path or file hash, same identity) stays an update.
+        // Another kit's template or id cannot be refreshed over this title.
+        if (composition.installer->SetupFromOtherKit(record) && !composition.installer->CompatibleKitIdentity(record))
+          view.setup_other_kit = true;
+      }
+    } else if (composition.installer && SetupRestarts(record) && !view.moving) {
       view.setup_other_kit = composition.installer->SetupFromOtherKit(record);
     }
     if (const auto found = composition.admission.find(record.install_id); found != composition.admission.end())
@@ -3149,6 +3156,12 @@ std::string RuntimeHost::RunPrepare(Composition& c, const RuntimePrepareRequest&
         existing = c.records.Find(existing->install_id);
         if (!existing) return "The game's install record is missing.";
       }
+      // Another kit's identity (a custom folder, or a parked copy with its own template) is not a
+      // refresh of this title. Recreate bottle keeps the saves and builds the title from that kit.
+      if (c.installer->SetupFromOtherKit(*existing) && !c.installer->CompatibleKitIdentity(*existing)) {
+        Log("prepare refused app=" + std::to_string(request.runtime_number) + ": title from another kit");
+        return std::string("This game's PS5 title was made from another runtime kit.") + kRecreateHint;
+      }
       bool changed = false;
       // Older titles carry the kit's generic name and icon: give them the game's.
       const bool metadata_current = c.installer->TitleMetadataCurrent(*existing) &&
@@ -4532,49 +4545,35 @@ bool RuntimeHost::RunServices() {
     operations.canceled = [this] { return Stopping(); };
     operations.progress = [this](std::uint64_t done, std::uint64_t total) { ReportWork(done, total); };
     operations.log = [this](const std::string& line) { Log(line); };
-    const auto version_of = [](const RuntimeKit& kit) {
-      const auto& artifact = kit.view.runtime.artifact_revision;
-      const auto version = playden::update::KitVersionFromArtifact(artifact);
-      return version ? rt::FormatKitVersion(*version) : std::string{};
-    };
-    const auto hold = [&](RuntimeKit kit, bool latest_slot) {
-      const auto version = version_of(kit);
-      if (!latest_slot && version.empty()) return;
-      if (!latest_slot)
-        for (const auto& held : c.held)
-          if (held.latest_slot && held.version == version) return;
+    const auto hold = [&](RuntimeKit kit, bool latest_slot, std::string folder) {
+      if (!latest_slot && folder.empty()) return;
       auto installer = std::make_unique<rt::FilesystemPackageInstaller>(kit.view, config_.package_paths, operations);
       std::vector<std::string> shipped;
       for (const auto& recipe : c.recipes) {
         if (rt::IsGeneratedRecipeId(recipe.id)) continue;
         if (const auto lacks = KitLacksForRecipe(recipe, kit.view); lacks.empty()) shipped.push_back(recipe.id);
-        else Log("recipe " + recipe.id + " refused kit=" + kit.view.kit_id + " " + version + " " + lacks);
+        else Log("recipe " + recipe.id + " refused kit=" + kit.view.kit_id + " " + folder + " " + lacks);
       }
       installer->AcceptShippedRecipes(std::move(shipped));
       installer->ShareBottleProfiles(rt::KitCapabilitiesFromManifest(kit.capabilities, true).bottle_profile_shared);
-      c.held.push_back({std::move(kit), latest_slot, version, std::move(installer)});
+      c.held.push_back({std::move(kit), latest_slot, std::move(folder), std::move(installer)});
     };
     if (config_.admit_kit) {
-      if (auto latest = config_.admit_kit(&kit_reason)) hold(std::move(*latest), true);
+      if (auto latest = config_.admit_kit(&kit_reason)) hold(std::move(*latest), true, {});
     }
     if (config_.admit_parked_kits)
-      for (auto& parked : config_.admit_parked_kits()) hold(std::move(parked), false);
+      for (auto& parked : config_.admit_parked_kits()) hold(std::move(parked.kit), false, std::move(parked.folder));
     bool latest_admits = false;
-    std::string latest_version;
-    std::vector<std::string> parked_versions;
+    std::vector<std::string> parked_folders;
     for (const auto& held : c.held) {
-      if (held.latest_slot) {
-        latest_admits = true;
-        latest_version = held.version;
-      } else if (!held.version.empty()) {
-        parked_versions.push_back(held.version);
-      }
+      if (held.latest_slot) latest_admits = true;
+      else if (!held.folder.empty()) parked_folders.push_back(held.folder);
     }
     const auto default_pin = config_.default_kit ? config_.default_kit() : std::string{};
-    const auto resolved = rt::ResolveKitPin(default_pin, latest_admits, latest_version, parked_versions);
+    const auto resolved = rt::ResolveKitPin(default_pin, latest_admits, parked_folders);
     for (const auto& held : c.held) {
       if (resolved.kind == rt::ResolvedKitKind::kLatestSlot && held.latest_slot) c.kit = held.kit;
-      if (resolved.kind == rt::ResolvedKitKind::kVersion && held.version == resolved.version && !held.latest_slot)
+      if (resolved.kind == rt::ResolvedKitKind::kFolder && held.folder == resolved.folder && !held.latest_slot)
         c.kit = held.kit;
     }
     if (!c.held.empty()) {
@@ -4770,7 +4769,7 @@ bool RuntimeHost::RunServices() {
           (c.settings_data_reason.empty() ? std::string{} : " settings_data=" + c.settings_data_reason));
       std::vector<RuntimeSnapshot::AdmittedKitInfo> admitted;
       for (const auto& held : c.held)
-        admitted.push_back({held.version, held.kit.view.kit_id, held.kit.manifest_sha256, held.latest_slot});
+        admitted.push_back({held.folder, held.kit.view.kit_id, held.kit.manifest_sha256, held.latest_slot});
       Publish([&](RuntimeSnapshot& s) {
         s.status = RuntimeHostStatus::kReady; s.reason.clear();
         s.kit_available = kit_available; s.kit_reason = kit_available ? std::string{} : kit_reason;

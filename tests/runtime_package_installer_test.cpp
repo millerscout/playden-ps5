@@ -1101,6 +1101,38 @@ void RenamedKitRefreshesItsTitles() {
   }
 }
 
+// A second kit root with another template path is not this title. A respin that changes only the
+// runtime path and the file hash still refreshes.
+void OtherTemplateIsNotRefreshedButARuntimePathIs() {
+  Fixture fixture;
+  std::filesystem::create_directories(fixture.host_data);
+  auto record = Record();
+  for (const auto& artifact : fixture.view.artifacts)
+    record.artifacts.push_back({artifact.artifact_id, artifact.identity, artifact.sha256});
+  {
+    auto installer = fixture.Installer();
+    CHECK(installer.StageTitle(record).state == PackageActionState::kComplete);
+    CHECK(installer.CopyTemplate(record).state == PackageActionState::kComplete);
+    CHECK(installer.TitleCurrent(record) && installer.CompatibleKitIdentity(record));
+  }
+  fixture.view.template_path = "template/other";
+  {
+    auto other = fixture.Installer();
+    CHECK(!other.TitleCurrent(record) && !other.CompatibleKitIdentity(record));
+    const auto refreshed = other.RefreshTitle(record);
+    CHECK(refreshed.state == PackageActionState::kFailed && refreshed.code == "refresh-ownership");
+  }
+  fixture.view.template_path = "template/bottle";
+  fixture.view.runtime.path = "runtime/wine/other";
+  fixture.view.files_sha256 = std::string(64, 'c');
+  auto respun = fixture.Installer();
+  CHECK(!respun.TitleCurrent(record) && respun.CompatibleKitIdentity(record) && respun.SetupFromOtherKit(record));
+  const auto refreshed = respun.RefreshTitle(record);
+  if (refreshed.state != PackageActionState::kComplete)
+    std::fprintf(stderr, "refresh: %s %s\n", refreshed.code.c_str(), refreshed.message.c_str());
+  CHECK(refreshed.state == PackageActionState::kComplete && respun.TitleCurrent(record));
+}
+
 void PrivateTitleFoldersAreRepublished() {
   Fixture fixture;
   auto installer = fixture.Installer();
@@ -1569,6 +1601,7 @@ int main() {
   AnyTitleVariantServesEveryTitle();
   FixedTitleRefreshesToAnyTitleShell();
   RenamedKitRefreshesItsTitles();
+  OtherTemplateIsNotRefreshedButARuntimePathIs();
   CreatedFoldersIgnoreUmask();
   RenameFailureReportsErrno();
   UnwritableParentIsNotACollision();

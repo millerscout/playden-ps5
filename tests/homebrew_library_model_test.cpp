@@ -3467,6 +3467,80 @@ void live_setup_from_an_earlier_kit_offers_recreate() {
     check(recreate && recreate->enabled, "Recreate bottle is there to use");
 }
 
+// The kit picker lists folder names, a saved old version falls back to Latest, and a Ready game
+// whose title is another kit's offers Recreate bottle instead of an update.
+void live_kit_folders_and_a_different_kit_recreates() {
+    using namespace playden::homebrew;
+    auto model = make_live();
+    model.UpdateAccount({AuthState::SignedIn, "123", "Synthetic", {}, {}, true});
+    model.SetAdmittedKits({{"", true}, {"playden-kit-bceed2d", false}, {"my-kit", false}});
+    playden::PreferencesLoadResult old_pin;
+    old_pin.preferences.default_kit = "0.17";
+    check(model.ApplyPreferences(model.BeginPreferencesLoad(), old_pin) && model.state().default_kit == "0.17",
+          "an old version pin loads");
+    for (int step = 0; step < 6 && model.state().navigation.route != Route::Settings; ++step) model.action("r1");
+    check(model.state().navigation.route == Route::Settings, "Settings opens");
+    const auto* saved = find_row(model, "settings-default-kit");
+    check(saved && saved->value == "Latest" && saved->subtitle == "0.17 is not installed. Using the latest kit.",
+          "a missing old pin uses Latest");
+    activate(model, "settings-default-kit");
+    const auto& rows = model.view().rows;
+    const auto index = [&](const std::string& key) {
+        return static_cast<std::size_t>(std::find_if(rows.begin(), rows.end(),
+                                                     [&](const auto& row) { return row.key == key; }) -
+                                        rows.begin());
+    };
+    check(has_row(model, "default-kit-latest") && has_row(model, "default-kit-my-kit") &&
+              has_row(model, "default-kit-playden-kit-bceed2d") &&
+              index("default-kit-latest") < index("default-kit-my-kit") &&
+              index("default-kit-my-kit") < index("default-kit-playden-kit-bceed2d"),
+          "Latest is first, then the folder names");
+    activate(model, "default-kit-my-kit");
+    check(model.state().default_kit == "my-kit" && model.state().navigation.modals.empty(), "choosing my-kit stores that pin");
+
+    check(model.UpdateLibrary({{game(SteamId(34), "Spire")}, false, {}, false, false, {}}), "library loaded");
+    model.UpdateInstalls({}, {{SteamId(34), 600'000'000}});
+    LiveRuntimeGame ready;
+    ready.game_id = SteamId(34);
+    ready.status = "Ready";
+    ready.ready = true;
+    ready.prepared = true;
+    ready.has_title = true;
+    ready.activity = TitleActivity::Stopped;
+    model.UpdateRuntime(RuntimeState::Ready, {ready});
+    check(model.action("details:34"), "the game page opens");
+    activate(model, "details-more");
+    activate(model, "game-settings");
+    activate(model, "game-kit");
+    check(has_row(model, "game-kit-default") && has_row(model, "game-kit-latest") && has_row(model, "game-kit-my-kit"),
+          "the game lists the same folders");
+    activate(model, "game-kit-my-kit");
+    check(model.state().game_settings.at(SteamId(34)).kit == "my-kit", "the game stores the folder pin");
+    while (!model.state().navigation.modals.empty()) model.action("circle");
+
+    LiveRuntimeGame other = ready;
+    other.status = "Kit update available";
+    other.ready = false;
+    other.can_prepare = true;
+    other.setup_other_kit = true;
+    model.UpdateRuntime(RuntimeState::Ready, {other});
+    const auto* play = find_row(model, "details-play");
+    check(play && play->enabled && play->title == "Recreate bottle…" && play->action == "prep-recreate-34",
+          "a Ready game on another kit offers Recreate bottle");
+    activate(model, "details-more");
+    activate(model, "game-maintenance");
+    model.TakeActivityRequests();
+    model.UpdateRuntime(RuntimeState::Ready, {other});
+    const auto* update = find_row(model, "maintenance-update");
+    check(update && !update->enabled && update->subtitle.find("Recreate bottle") != std::string::npos,
+          "Update runtime does not run for another kit");
+    activate(model, "maintenance-update");
+    check(model.state().navigation.modals.back().id == "game-maintenance" && model.TakeMaintenanceRequests().empty(),
+          "the update action asks for nothing");
+    check(find_row(model, "maintenance-recreate") && find_row(model, "maintenance-recreate")->enabled,
+          "Recreate bottle stays available");
+}
+
 // The game page of a waiting game names the game right ahead of it and offers Prepare next.
 void live_details_prepare_next() {
     using namespace playden::homebrew;
@@ -4269,6 +4343,7 @@ int main() {
     live_queue_lists_preparations_needing_attention();
     live_refused_preparation_offers_uninstall();
     live_setup_from_an_earlier_kit_offers_recreate();
+    live_kit_folders_and_a_different_kit_recreates();
     live_queue_lists_uninstalls();
     live_details_prepare_next();
     std::cout << "homebrew_library_model_test passed\n";

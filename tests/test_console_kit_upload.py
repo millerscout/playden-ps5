@@ -45,21 +45,22 @@ class KitFolderTests(unittest.TestCase):
 
 
 class ParkedFolderTests(unittest.TestCase):
-    def test_names_the_folder_from_the_artifact_version(self):
+    def test_names_the_folder_from_the_git_hash(self):
         manifest = {"runtime": {"artifact_revision": "abc-kit-0.16"}}
         self.assertEqual(console_kit_upload.parked_folder("/data/playden/kits", "playden-kit", manifest),
-                         "/data/playden/kits/playden-kit-0.16")
+                         "/data/playden/kits/playden-kit-abc")
+        kit_h = {"runtime": {"artifact_revision": "bceed2d-kit-h-r1"}}
+        self.assertEqual(console_kit_upload.parked_folder("/data/playden/kits", "playden-kit", kit_h),
+                         "/data/playden/kits/playden-kit-bceed2d")
 
-    def test_a_kit_without_a_version_is_not_parked(self):
+    def test_a_kit_without_a_git_hash_is_not_parked(self):
         self.assertIsNone(console_kit_upload.parked_folder("/data/playden/kits", "playden-kit", {}))
         self.assertIsNone(console_kit_upload.parked_folder("/data/playden/kits", "playden-kit",
                                                            {"runtime": {"artifact_revision": "h-r9"}}))
-
-    def test_an_unsafe_version_is_not_parked(self):
         self.assertIsNone(console_kit_upload.parked_folder("/data/playden/kits", "playden-kit",
-                                                           {"runtime": {"artifact_revision": "abc-kit-../0.16"}}))
+                                                           {"runtime": {"artifact_revision": "AB-kit-0.16"}}))
         self.assertIsNone(console_kit_upload.parked_folder("/data/playden/kits", "playden-kit",
-                                                           {"runtime": {"artifact_revision": "abc-kit-.hidden"}}))
+                                                           {"runtime": {"artifact_revision": "../abc-kit-0.16"}}))
 
 
 if __name__ == '__main__':

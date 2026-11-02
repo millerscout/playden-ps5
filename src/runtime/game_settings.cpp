@@ -1595,7 +1595,7 @@ bool RecordFromValue(const storage_json::Value& root, GameSettingsRecord* out) {
     out->steam_launch = steam::RelativeGamePath(launch->text()).value_or(std::string());
   // A kit pin this build does not understand is dropped: the game follows the default.
   if (const auto* kit = root.Find("kit"); kit && kit->is_string() &&
-      (kit->text() == kLatestKitPin || IsConcreteKitPin(kit->text())))
+      (kit->text() == kLatestKitPin || IsKitFolderPin(kit->text())))
     out->kit = kit->text();
   // Pixel shaders "auto" (Automatic) is gone; such a record takes the default, wave32.
   if (const auto waves = out->overrides.find("pixel_shader_waves");
@@ -1639,7 +1639,7 @@ std::string SerializeGameSettingsRecord(const GameSettingsRecord& record) {
   text += "}";
   if (record.steam_app_id) text += ",\"steam_app_id\":\"" + std::to_string(record.steam_app_id) + "\"";
   if (!record.steam_launch.empty()) text += ",\"steam_launch\":\"" + json::escape(record.steam_launch) + "\"";
-  if (record.kit == kLatestKitPin || IsConcreteKitPin(record.kit))
+  if (record.kit == kLatestKitPin || IsKitFolderPin(record.kit))
     text += ",\"kit\":\"" + json::escape(record.kit) + "\"";
   return text + "}";
 }

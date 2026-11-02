@@ -290,30 +290,25 @@ void clear_profile_customizations(State& state) { state.game_settings.clear(); }
 
 namespace rt = playden::runtime;
 
-std::vector<std::string> AvailableKitVersions(const std::vector<AdmittedKit>& kits) {
-    struct Item { std::string version; playden::update::KitVersion parsed; };
-    std::vector<Item> items;
+std::vector<std::string> AvailableKitFolders(const std::vector<AdmittedKit>& kits) {
+    std::vector<std::string> names;
     for (const auto& kit : kits) {
-        const auto parsed = playden::update::ParseKitVersion(kit.version);
-        if (!parsed) continue;
-        if (std::none_of(items.begin(), items.end(), [&](const Item& item) { return item.version == kit.version; }))
-            items.push_back({kit.version, *parsed});
+        if (kit.latest_slot || kit.folder.empty()) continue;
+        if (std::none_of(names.begin(), names.end(), [&](const std::string& name) { return name == kit.folder; }))
+            names.push_back(kit.folder);
     }
-    std::sort(items.begin(), items.end(), [](const Item& a, const Item& b) { return b.parsed < a.parsed; });
-    std::vector<std::string> versions;
-    for (const auto& item : items) versions.push_back(item.version);
-    return versions;
+    std::sort(names.begin(), names.end());
+    return names;
 }
 
 rt::ResolvedKit ResolveShownKit(std::string_view pin, const std::vector<AdmittedKit>& kits) {
     bool latest_admits = false;
-    std::string latest_version;
     std::vector<std::string> folders;
     for (const auto& kit : kits) {
-        if (kit.latest_slot) { latest_admits = true; latest_version = kit.version; }
-        else folders.push_back(kit.version);
+        if (kit.latest_slot) latest_admits = true;
+        else if (!kit.folder.empty()) folders.push_back(kit.folder);
     }
-    return rt::ResolveKitPin(pin, latest_admits, latest_version, folders);
+    return rt::ResolveKitPin(pin, latest_admits, folders);
 }
 
 std::string choice_label(const rt::SettingDefinition& definition, const std::string& value) {
@@ -2428,7 +2423,7 @@ void Simulation::SetAdmittedKits(std::vector<AdmittedKit> kits) {
     const auto same = kits.size() == state_.admitted_kits.size() &&
                       std::equal(kits.begin(), kits.end(), state_.admitted_kits.begin(),
                                  [](const AdmittedKit& a, const AdmittedKit& b) {
-                                     return a.version == b.version && a.latest_slot == b.latest_slot;
+                                     return a.folder == b.folder && a.latest_slot == b.latest_slot;
                                  });
     if (same) return;
     state_.admitted_kits = std::move(kits);
@@ -5763,17 +5758,17 @@ void Simulation::rebuild_view() {
                 if (action_key == "default-kit-latest" || action_key == "game-kit-latest") {
                     item.title = "Latest";
                     item.subtitle = "The kit Playden installs.";
-                    item.selected = modal.id == "default-kit" ? !rt::IsConcreteKitPin(state_.default_kit)
+                    item.selected = modal.id == "default-kit" ? !rt::IsKitFolderPin(state_.default_kit)
                                                               : game_pin == rt::kLatestKitPin;
                 } else if (action_key == "game-kit-default") {
                     item.title = "Default";
                     const auto resolved = ResolveShownKit(state_.default_kit, state_.admitted_kits);
-                    item.subtitle = resolved.version.empty() ? "The kit from Settings." : "The kit from Settings, " + resolved.version + ".";
+                    item.subtitle = resolved.folder.empty() ? "The kit from Settings." : "The kit from Settings, " + resolved.folder + ".";
                     item.selected = game_pin.empty();
                 } else if (action_key.rfind("default-kit-", 0) == 0 || action_key.rfind("game-kit-", 0) == 0) {
-                    const auto version = action_key.substr(action_key.rfind("default-kit-", 0) == 0 ? 12 : 9);
-                    item.title = version;
-                    item.selected = modal.id == "default-kit" ? state_.default_kit == version : game_pin == version;
+                    const auto folder = action_key.substr(action_key.rfind("default-kit-", 0) == 0 ? 12 : 9);
+                    item.title = folder;
+                    item.selected = modal.id == "default-kit" ? state_.default_kit == folder : game_pin == folder;
                 }
                 if (item.selected) item.value = "In use";
             }
@@ -5888,15 +5883,13 @@ void Simulation::rebuild_view() {
                                                    state_.admitted_kits);
                 if (pin.empty()) {
                     item.value = "Default";
-                    item.subtitle = shown.version.empty() ? "Uses the default kit." : "Uses the default, " + shown.version + ".";
-                } else if (!rt::IsConcreteKitPin(pin)) {
+                    item.subtitle = shown.folder.empty() ? "Uses the default kit." : "Uses the default, " + shown.folder + ".";
+                } else if (!rt::IsKitFolderPin(pin)) {
                     item.value = "Latest";
-                    item.subtitle = shown.version.empty() ? "This game uses the kit Playden installs."
-                                                          : "Using " + shown.version + ".";
+                    item.subtitle = "This game uses the kit Playden installs.";
                 } else if (shown.fell_back || shown.kind == rt::ResolvedKitKind::kUnavailable) {
                     item.value = "Latest";
-                    item.subtitle = pin + " is not installed. Using " +
-                                    (shown.version.empty() ? std::string("the latest kit") : shown.version) + ".";
+                    item.subtitle = pin + " is not installed. Using the latest kit.";
                 } else {
                     item.value = pin;
                     item.subtitle = "This game uses this kit.";
@@ -6166,15 +6159,19 @@ void Simulation::rebuild_view() {
                             : "Nothing to reset: the settings follow the preset.";
                 } else if (kind == MaintenanceKind::UpdateRuntime) {
                     // What Play does first for a title on an older kit's runtime ("Kit update available"), alone.
+                    // A different kit identity is not that update: Recreate bottle builds the title again.
+                    const bool other_kit = runtime && runtime->setup_other_kit;
                     const bool stale = runtime && (runtime->status == "Kit update available" || runtime->status == "Update available");
                     item.title = "Update runtime…";
                     item.subtitle = "Moves the game to the installed kit's runtime without starting it.";
                     item.badge = "Game must be closed";
-                    item.enabled = stale && runtime->can_prepare && closed && !busy;
+                    item.enabled = stale && !other_kit && runtime->can_prepare && closed && !busy;
                     // While it runs the title is being prepared, no longer "Kit update available".
                     const bool updating = busy && runtime->maintenance == MaintenanceKind::UpdateRuntime;
                     // A setup an earlier kit left has no title to update: it is made again.
-                    if (!stale && !updating)
+                    if (other_kit && stale && !updating)
+                        item.subtitle = "This title was made from another kit. Use Recreate bottle; saves are kept.";
+                    else if (!stale && !updating)
                         item.subtitle = runtime && runtime->status == "No kit" ? "Needs a usable runtime kit."
                                       : runtime && runtime->setup_other_kit
                                           ? "Setup was started with an earlier kit. Use Recreate bottle to finish it; saves are kept."
@@ -7414,13 +7411,12 @@ void Simulation::rebuild_view() {
         if (live()) {
             auto& kit = add("settings-default-kit", RowKind::Action, "Default runtime kit", "default-kit-picker");
             const auto resolved = ResolveShownKit(state_.default_kit, state_.admitted_kits);
-            if (!rt::IsConcreteKitPin(state_.default_kit)) {
+            if (!rt::IsKitFolderPin(state_.default_kit)) {
                 kit.value = "Latest";
-                kit.subtitle = resolved.version.empty() ? "The kit Playden installs." : "Using " + resolved.version + ".";
+                kit.subtitle = "The kit Playden installs.";
             } else if (resolved.fell_back || resolved.kind == rt::ResolvedKitKind::kUnavailable) {
                 kit.value = "Latest";
-                kit.subtitle = state_.default_kit + " is not installed. Using " +
-                               (resolved.version.empty() ? std::string("the latest kit") : resolved.version) + ".";
+                kit.subtitle = state_.default_kit + " is not installed. Using the latest kit.";
             } else {
                 kit.value = state_.default_kit;
                 kit.subtitle = "Games that have not chosen a kit use this one.";
@@ -8935,21 +8931,21 @@ void Simulation::activate() {
         return;
     } else if (action_name == "default-kit-picker") {
         std::vector<std::string> actions = {"default-kit-latest"};
-        for (const auto& version : AvailableKitVersions(state_.admitted_kits))
-            actions.push_back("default-kit-" + version);
+        for (const auto& folder : AvailableKitFolders(state_.admitted_kits))
+            actions.push_back("default-kit-" + folder);
         actions.push_back("cancel");
         int focus = 0;
         for (std::size_t index = 0; index < actions.size(); ++index)
-            if (rt::IsConcreteKitPin(state_.default_kit) && actions[index] == "default-kit-" + state_.default_kit)
+            if (rt::IsKitFolderPin(state_.default_kit) && actions[index] == "default-kit-" + state_.default_kit)
                 focus = static_cast<int>(index);
         open_modal({"default-kit", "Default runtime kit", state_.navigation.focus_key, std::move(actions), focus, false});
     } else if (!state_.navigation.modals.empty() && state_.navigation.modals.back().id == "default-kit" &&
                (action_name == "default-kit-latest" || action_name.rfind("default-kit-", 0) == 0)) {
         if (action_name == "default-kit-latest") state_.default_kit = rt::kLatestKitPin;
         else {
-            const auto version = action_name.substr(std::string("default-kit-").size());
-            if (!rt::IsConcreteKitPin(version)) { close_modal(); return; }
-            state_.default_kit = version;
+            const auto folder = action_name.substr(std::string("default-kit-").size());
+            if (!rt::IsKitFolderPin(folder)) { close_modal(); return; }
+            state_.default_kit = folder;
         }
         save_profile();
         close_modal();
@@ -10096,9 +10092,9 @@ void Simulation::activate() {
         const auto record = state_.game_settings.find(state_.navigation.selected_game_id);
         const std::string pin = record == state_.game_settings.end() ? std::string{} : record->second.kit;
         int focus = pin.empty() ? 0 : pin == rt::kLatestKitPin ? 1 : 0;
-        for (const auto& version : AvailableKitVersions(state_.admitted_kits)) {
-            if (pin == version) focus = static_cast<int>(actions.size());
-            actions.push_back("game-kit-" + version);
+        for (const auto& folder : AvailableKitFolders(state_.admitted_kits)) {
+            if (pin == folder) focus = static_cast<int>(actions.size());
+            actions.push_back("game-kit-" + folder);
         }
         actions.push_back("cancel");
         open_modal({"game-kit", "Runtime kit", "game-kit", std::move(actions), focus, false});
@@ -10109,7 +10105,7 @@ void Simulation::activate() {
         if (action_name == "game-kit-latest") pin = rt::kLatestKitPin;
         else if (action_name != "game-kit-default") {
             pin = action_name.substr(std::string("game-kit-").size());
-            if (!rt::IsConcreteKitPin(pin)) { close_modal(); return; }
+            if (!rt::IsKitFolderPin(pin)) { close_modal(); return; }
         }
         const auto game = state_.navigation.selected_game_id;
         if (pin.empty()) {

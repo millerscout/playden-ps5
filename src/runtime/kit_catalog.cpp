@@ -47,8 +47,9 @@ std::vector<std::string> PruneUnpinnedKits(const std::string& kits_root, std::st
   }
   closedir(folder);
   for (const auto& name : names) {
+    if (!UpdaterParkedFolder(kit_id, name) || Pinned(pinned, name)) continue;
     std::string version;
-    if (!ParkedKitVersion(kit_id, name, &version) || Pinned(pinned, version)) continue;
+    if (ParkedKitVersion(kit_id, name, &version) && Pinned(pinned, version)) continue;
     const std::string path = kits_root + "/" + name;
     struct stat info {};
     if (lstat(path.c_str(), &info) != 0 || !S_ISDIR(info.st_mode) || S_ISLNK(info.st_mode)) continue;

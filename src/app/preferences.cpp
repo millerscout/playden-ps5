@@ -20,7 +20,7 @@ std::string ToString(const Bytes& bytes) {
 
 // Versions 8 to 11: one "key=value" line per field, in this order, each ending in a newline. Version 9 adds
 // web_access (on in older files), version 10 content_language (English in older files, which is what they
-// downloaded), version 11 default_kit (Latest in older files, which is the one installed kit).
+// downloaded), version 11 default_kit (Latest in older files; a folder name is kept).
 constexpr const char* kVersionElevenKeys[] = {"reduce_motion", "title_store_suffix", "cloud_saves_auto",
                                           "steam_sign_in_password", "downloads_slow_network", "steam_stay_signed_in",
                                           "beta_updates", "download_server", "web_access", "content_language",
@@ -65,7 +65,7 @@ bool ParseKeyed(const std::string& serialized, int version, Preferences* prefere
     if (!steam::IsContentLanguage(values[9])) return false;
     parsed.content_language = values[9];
   }
-  // A kit pin this build does not understand is Latest, without resetting the other preferences.
+  // A kit pin that is not Latest or a folder name is Latest, without resetting the other preferences.
   if (version >= 11) parsed.default_kit = runtime::NormalizedKitPin(values[10]);
   // A host the current rule refuses is dropped without resetting unrelated preferences.
   if (ValidDownloadServer(values[7])) parsed.download_server = values[7];

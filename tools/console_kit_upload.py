@@ -64,7 +64,7 @@ def kit_folder(path):
 
 
 def parked_folder(remote_parent, kit_id, manifest):
-    """Where a replaced kit is kept, named by its version, or None when it has none."""
+    """Where a replaced kit is kept, named by its git hash, or None when it has none."""
     runtime = manifest.get("runtime") if isinstance(manifest, dict) else None
     artifact = runtime.get("artifact_revision") if isinstance(runtime, dict) else None
     if not isinstance(artifact, str):
@@ -73,10 +73,10 @@ def parked_folder(remote_parent, kit_id, manifest):
     at = artifact.find(marker)
     if at < 0:
         return None
-    version = artifact[at + len(marker):]
-    if not version or version.startswith(".") or any(c not in "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-._" for c in version):
+    git_hash = artifact[:at]
+    if len(git_hash) < 3 or len(git_hash) > 40 or any(c not in "0123456789abcdef" for c in git_hash):
         return None
-    return f"{remote_parent}/{kit_id}-{version}"
+    return f"{remote_parent}/{kit_id}-{git_hash}"
 
 
 def main():
@@ -167,8 +167,8 @@ def main():
             print("  " + problem, file=sys.stderr)
         return 2
     if kit_id in parent:
-        # Named by the kit's version when it has one, so a game pinned to that version can keep it.
-        # A kit with no version, or a copy of that version already parked, moves aside as before.
+        # Named by the kit's git hash when it has one, so a game pinned to that folder can keep it.
+        # A kit with no git hash, or a copy of that hash already parked, moves aside as before.
         previous = io.BytesIO()
         parked = None
         try:

@@ -508,10 +508,11 @@ int main() {
         self_update.Check(false);
         // "Export as recipe" writes next to the logs, which are read over FTP already.
         simulation.SetRecipeExportTarget(log_root, playden::ps5::ConsoleFirmwareVersion().value_or(""));
-        // A parked kit nothing is pinned to is removed. The Latest slot and a folder that does not admit stay.
+        // An updater-parked kit nothing is pinned to is removed. The Latest slot, a custom playkit, and a
+        // folder that does not admit stay.
         {
             std::vector<std::string> pins;
-            if (playden::runtime::IsConcreteKitPin(preferences.Load().preferences.default_kit))
+            if (playden::runtime::IsKitFolderPin(preferences.Load().preferences.default_kit))
                 pins.push_back(preferences.Load().preferences.default_kit);
 #if !PLAYDEN_UI_SIMULATION
             if (settings_file) {
@@ -519,7 +520,7 @@ int main() {
                 std::string reason;
                 if (playden::runtime::LoadGameSettingsFile(settings_file->string(), &records, &reason))
                     for (const auto& entry : records)
-                        if (playden::runtime::IsConcreteKitPin(entry.second.kit)) pins.push_back(entry.second.kit);
+                        if (playden::runtime::IsKitFolderPin(entry.second.kit)) pins.push_back(entry.second.kit);
             }
 #endif
             std::vector<std::string> removed;
@@ -576,14 +577,14 @@ int main() {
             };
             config.default_kit = [] { return selected_default_kit(); };
             config.admit_parked_kits = [] {
-                std::vector<playden::homebrew::RuntimeKit> found;
+                std::vector<playden::homebrew::ParkedRuntimeKit> found;
                 DIR* folder = opendir("/data/playden/kits");
                 if (!folder) return found;
                 const auto admission = rt::DevelopmentKitAdmission();
                 while (const dirent* entry = readdir(folder)) {
-                    std::string version;
-                    if (!rt::ParkedKitVersion(rt::kDevelopmentKitId, entry->d_name, &version)) continue;
-                    const std::string path = std::string("/data/playden/kits/") + entry->d_name;
+                    const std::string name = entry->d_name;
+                    if (name == rt::kDevelopmentKitId || !rt::IsKitFolderPin(name)) continue;
+                    const std::string path = std::string("/data/playden/kits/") + name;
                     auto admitted = rt::VerifyInstalledKit(path, admission);
                     if (admitted.status != rt::KitManifestStatus::kVerified || !admitted.view) {
                         playden::app::AppendLogLine(log_root, "runtime.log", "parked kit skipped " + path + " " + admitted.reason);
@@ -592,9 +593,9 @@ int main() {
                     const auto wrapper = admitted.sources.find("wrapper");
                     const auto revision = wrapper != admitted.sources.end() && wrapper->second.count("revision")
                         ? wrapper->second.at("revision") : std::string{};
-                    playden::app::AppendLogLine(log_root, "runtime.log", "parked kit admitted version=" + version + " root=" + path);
-                    found.push_back({*admitted.view, admitted.capabilities, admitted.manifest_sha256,
-                                     admission.expected_manifest_sha256, revision, admitted.source_dirty});
+                    playden::app::AppendLogLine(log_root, "runtime.log", "parked kit admitted folder=" + name + " root=" + path);
+                    found.push_back({name, {*admitted.view, admitted.capabilities, admitted.manifest_sha256,
+                                            admission.expected_manifest_sha256, revision, admitted.source_dirty}});
                 }
                 closedir(folder);
                 return found;

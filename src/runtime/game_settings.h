@@ -200,8 +200,8 @@ struct GameSettingsRecord {
   // Install. Its option goes first when the game is prepared. Empty: not set. Saved only when set.
   std::string steam_launch;
   // The runtime kit this game is prepared with. Empty: the default in preferences. "latest": the kit
-  // in the Latest slot. A version ("0.17"): that kit when it is still installed, otherwise Latest.
-  // Saved only when set.
+  // in the Latest slot. A folder name ("my-kit"): that directory when it is still installed, otherwise
+  // Latest. Saved only when set.
   std::string kit;
 };
 

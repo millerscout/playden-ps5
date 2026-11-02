@@ -43,6 +43,12 @@ struct RuntimeKit {
   bool source_dirty = false;
 };
 
+// A kit in a directory other than the Latest slot, named by that directory.
+struct ParkedRuntimeKit {
+  std::string folder;
+  RuntimeKit kit;
+};
+
 // A game's private bottle kept after its PS5 title was removed: its saves and
 // settings, until the game is prepared again or the player deletes it.
 struct KeptBottleView {
@@ -76,9 +82,9 @@ struct RuntimeHostConfig {
   ps5::TitleRegistry::Transport registry_transport;
   // Verifies the kit in the Latest slot (/data/playden/kits/playden-kit), or returns nothing with a reason.
   std::function<std::optional<RuntimeKit>(std::string* reason)> admit_kit;
-  // Parked copies, playden-kit-<version>, that still admit. Empty when the host has only the Latest slot.
-  std::function<std::vector<RuntimeKit>()> admit_parked_kits;
-  // The default kit pin ("latest" or a version). Empty reads as Latest.
+  // Other kit directories that still admit, each with its folder name. Empty when only Latest is installed.
+  std::function<std::vector<ParkedRuntimeKit>()> admit_parked_kits;
+  // The default kit pin ("latest" or a folder name). Empty reads as Latest.
   std::function<std::string()> default_kit;
   // Package layer paths and base operations (hashing, sync, space, bottle
   // validation). The host adds cancellation.
@@ -303,9 +309,9 @@ struct RuntimeSnapshot {
   bool kit_available = false;
   std::string kit_reason;  // why preparation is unavailable
   std::optional<RuntimeKit> kit;  // the resolved default kit, for display
-  // Every admitted kit, Latest slot first. A game pinned to a version uses that entry.
+  // Every admitted kit, Latest slot first. A game pinned to a folder uses that entry.
   struct AdmittedKitInfo {
-    std::string version;
+    std::string folder;
     std::string kit_id;
     std::string manifest_sha256;
     bool latest_slot = false;

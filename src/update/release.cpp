@@ -187,6 +187,21 @@ std::optional<KitVersion> KitVersionFromArtifact(std::string_view artifact) {
   return ParseKitVersion(artifact.substr(at + kKit.size()));
 }
 
+bool IsGitHash(std::string_view text) {
+  if (text.size() < 3 || text.size() > 40) return false;
+  for (unsigned char c : text)
+    if (!((c >= '0' && c <= '9') || (c >= 'a' && c <= 'f'))) return false;
+  return true;
+}
+
+std::string ArtifactGitHash(std::string_view artifact) {
+  constexpr std::string_view kKit = "-kit-";
+  const auto at = artifact.find(kKit);
+  if (at == std::string_view::npos) return {};
+  const auto hash = artifact.substr(0, at);
+  return IsGitHash(hash) ? std::string(hash) : std::string{};
+}
+
 std::optional<UpdateManifest> ParseUpdateManifest(std::string_view json, std::string* error) {
   auto refuse = [&](const char* reason) -> std::optional<UpdateManifest> {
     if (error) *error = reason;

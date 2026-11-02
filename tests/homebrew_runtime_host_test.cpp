@@ -925,10 +925,11 @@ void RefreshesInstalledTitleToRespunKit() {
     second.admit_kit = [other](std::string*) { return std::optional<RuntimeKit>(other); };
     RuntimeHost host(second);
     CHECK(host.Start());
-    CHECK(!WaitFor(host, Started).installs[0].title_current);
+    const auto other_started = WaitFor(host, Started);
+    CHECK(!other_started.installs[0].title_current && other_started.installs[0].setup_other_kit);
     host.Prepare(Hl2());
     const auto refused = WaitFor(host, [](const RuntimeSnapshot& s) { return !s.preparing_app && s.refusals.count(220); });
-    CHECK(refused.refusals.at(220).find("compatible kit") != std::string::npos);
+    CHECK(refused.refusals.at(220).find("Recreate bottle") != std::string::npos);
     host.Shutdown();
   }
   const auto respun = SyntheticKit(fixture.root / "kit-respun", "native-2", "kit-1", 'c');
@@ -936,7 +937,8 @@ void RefreshesInstalledTitleToRespunKit() {
   third.admit_kit = [respun](std::string*) { return std::optional<RuntimeKit>(respun); };
   RuntimeHost host(third);
   CHECK(host.Start());
-  CHECK(!WaitFor(host, Started).installs[0].title_current);
+  const auto respun_started = WaitFor(host, Started);
+  CHECK(!respun_started.installs[0].title_current && !respun_started.installs[0].setup_other_kit);
   host.Prepare(Hl2());
   const auto done = WaitFor(host, [](const RuntimeSnapshot& s) {
     return !s.preparing_app && !s.installs.empty() && (s.installs[0].title_current || s.refusals.count(220));
@@ -1118,6 +1120,111 @@ void SetupFromAnEarlierKitAsksForRecreate() {
   CHECK(!done.refusals.count(220) && done.installs.size() == 1 && done.installs[0].state == PreparationState::kReady);
   CHECK(done.installs[0].title_current && !done.installs[0].setup_other_kit);
   CHECK(Read(save) == "player-save");
+  host.Shutdown();
+}
+
+// A folder kit with no artifact version is still admitted, and a default pin of that folder selects it.
+void AdmittedFolderIsKeptWithoutAnArtifactVersion() {
+  Fixture fixture;
+  auto config = fixture.Config();
+  const auto latest = SyntheticKit(fixture.root / "kit");
+  auto mine = SyntheticKit(fixture.root / "my-kit", "native", "kit-1", 'b');
+  mine.view.runtime.artifact_revision.clear();
+  config.admit_kit = [latest](std::string*) { return std::optional<RuntimeKit>(latest); };
+  config.admit_parked_kits = [mine] { return std::vector<ParkedRuntimeKit>{{"my-kit", mine}}; };
+  config.default_kit = [] { return std::string("my-kit"); };
+  RuntimeHost host(config);
+  CHECK(host.Start());
+  const auto ready = WaitFor(host, Started);
+  CHECK(ready.kit_available && ready.kit && ready.kit->view.root == mine.view.root);
+  CHECK(ready.kit->view.runtime.artifact_revision.empty());
+  CHECK(ready.admitted_kits.size() == 2 && ready.admitted_kits[0].latest_slot && ready.admitted_kits[0].folder.empty());
+  CHECK(ready.admitted_kits[1].folder == "my-kit" && !ready.admitted_kits[1].latest_slot);
+  host.Shutdown();
+}
+
+RuntimeHostConfig TwoKitConfig(Fixture& fixture, unsigned* uuids, GameSettingsRecord* saved) {
+  auto config = fixture.Config();
+  config.host_namespace_prefix = fixture.root;
+  config.package_paths.console_data_root = "/data";
+  config.package_paths.host_data_root = fixture.root / "data";
+  config.package_operations.hash_file = HashArtifactFile;
+  config.package_operations.hash_bytes = HashArtifactBytes;
+  config.package_operations.free_space_unverifiable = true;
+  config.package_operations.validate_bottle = [](const fs::path& bottle) {
+    return fs::is_regular_file(bottle / "system.reg") && fs::is_regular_file(bottle / "user.reg");
+  };
+  config.uuid = [uuids]() -> std::optional<std::string> {
+    ++*uuids;
+    return "00000000-0000-4000-8000-" + std::string(12 - std::to_string(*uuids).size(), '0') + std::to_string(*uuids);
+  };
+  config.unix_time = [] { return std::int64_t{1760000000}; };
+  config.settings_record = [saved](const playden::GameId&) -> std::optional<GameSettingsRecord> { return *saved; };
+  config.default_kit = [] { return std::string("latest"); };
+  return config;
+}
+
+// A game pinned to another folder is prepared from that kit. One already prepared on Latest is not
+// refreshed onto it: the title's kit identity differs, so Prepare asks for Recreate bottle.
+// An empty pin keeps following Latest.
+void PinnedFolderUsesThatKitAndDoesNotRefreshAnother() {
+  Fixture prepared;
+  unsigned prepared_uuids = 0;
+  GameSettingsRecord pinned;
+  pinned.kit = "my-kit";
+  auto prepared_config = TwoKitConfig(prepared, &prepared_uuids, &pinned);
+  const auto prepared_latest = SyntheticKit(prepared.root / "kit");
+  const auto prepared_mine = SyntheticKit(prepared.root / "kits-my", "other-native", "kit-9", 'b');
+  prepared_config.admit_kit = [prepared_latest](std::string*) { return std::optional<RuntimeKit>(prepared_latest); };
+  prepared_config.admit_parked_kits = [prepared_mine] {
+    return std::vector<ParkedRuntimeKit>{{"my-kit", prepared_mine}};
+  };
+  Write(prepared.root / "data/homebrew/FAKE77031/games/220/hl2.exe", "existing-game", 0644);
+  {
+    RuntimeHost host(prepared_config);
+    CHECK(host.Start());
+    host.Prepare(Hl2());
+    const auto ready = WaitFor(host, [](const RuntimeSnapshot& s) {
+      return !s.preparing_app && !s.installs.empty() &&
+             (s.installs[0].state == PreparationState::kReady || s.refusals.count(220));
+    }, 60);
+    if (ready.refusals.count(220)) std::fprintf(stderr, "Pinned prepare refused: %s\n", ready.refusals.at(220).c_str());
+    CHECK(!ready.refusals.count(220) && ready.installs[0].state == PreparationState::kReady);
+    CHECK(ready.installs[0].title_current && ready.installs[0].runtime_current && !ready.installs[0].setup_other_kit);
+    host.Shutdown();
+  }
+
+  Fixture fixture;
+  unsigned uuids = 0;
+  GameSettingsRecord saved;
+  auto config = TwoKitConfig(fixture, &uuids, &saved);
+  const auto latest = SyntheticKit(fixture.root / "kit");
+  const auto mine = SyntheticKit(fixture.root / "kits-my", "other-native", "kit-9", 'b');
+  config.admit_kit = [latest](std::string*) { return std::optional<RuntimeKit>(latest); };
+  config.admit_parked_kits = [mine] { return std::vector<ParkedRuntimeKit>{{"my-kit", mine}}; };
+  Write(fixture.root / "data/homebrew/FAKE77031/games/220/hl2.exe", "existing-game", 0644);
+  {
+    RuntimeHost host(config);
+    CHECK(host.Start());
+    host.Prepare(Hl2());
+    const auto ready = WaitFor(host, [](const RuntimeSnapshot& s) {
+      return !s.preparing_app && !s.installs.empty() &&
+             (s.installs[0].state == PreparationState::kReady || s.refusals.count(220));
+    }, 60);
+    if (ready.refusals.count(220)) std::fprintf(stderr, "Latest prepare refused: %s\n", ready.refusals.at(220).c_str());
+    CHECK(!ready.refusals.count(220) && ready.installs[0].title_current && ready.installs[0].runtime_current &&
+          !ready.installs[0].setup_other_kit);
+    host.Shutdown();
+  }
+  saved.kit = "my-kit";
+  RuntimeHost host(config);
+  CHECK(host.Start());
+  const auto started = WaitFor(host, Started);
+  CHECK(started.installs[0].setup_other_kit && !started.installs[0].title_current && !started.installs[0].runtime_current);
+  host.Prepare(Hl2());
+  const auto refused = WaitFor(host, [](const RuntimeSnapshot& s) { return !s.preparing_app && s.refusals.count(220); }, 60);
+  CHECK(refused.refusals.count(220) && refused.refusals.at(220).find("Recreate bottle") != std::string::npos);
+  CHECK(refused.installs[0].setup_other_kit && refused.installs[0].state == PreparationState::kReady);
   host.Shutdown();
 }
 
@@ -6066,6 +6173,8 @@ int main(int argc, char** argv) {
   RefreshesInstalledTitleToRespunKit();
   RetryAfterKitRespinBindsTheNewArtifacts();
   SetupFromAnEarlierKitAsksForRecreate();
+  AdmittedFolderIsKeptWithoutAnArtifactVersion();
+  PinnedFolderUsesThatKitAndDoesNotRefreshAnother();
   RepairsBottleRegistryModes();
   PlaysReadyTitleThroughHandoff();
   ReplacedKitAsksForRestart();

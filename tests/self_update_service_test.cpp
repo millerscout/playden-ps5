@@ -417,8 +417,9 @@ int main() {
     CHECK(Read(test.kits + "/.replaced-kitid-1000/manifest.json") == std::string(64, 'b'));
     service.Shutdown();
   }
-  // A kit whose version can be named is parked beside the Latest slot. A copy of that version already
-  // parked is left alone, and the outgoing kit is the ".replaced-" leftover.
+  // A kit is parked beside the Latest slot under its git hash. A copy of that hash already parked is
+  // left alone, and the outgoing kit is the ".replaced-" leftover. A kit H name, which is not a version,
+  // is parked the same way.
   {
     const std::string old = R"({"runtime":{"artifact_revision":"abc-kit-0.16"}})";
     KitOnly parked("kit-park", old);
@@ -429,20 +430,72 @@ int main() {
     Wait(service);
     CHECK(service.Snapshot().kit.phase == KitInstallPhase::kInstalled);
     CHECK(Read(parked.kits + "/kitid/manifest.json") == kKitSha);
-    CHECK(Read(parked.kits + "/kitid-0.16/manifest.json") == old);
+    CHECK(Read(parked.kits + "/kitid-abc/manifest.json") == old);
     CHECK(!Exists(parked.kits + "/.replaced-kitid-1000"));
     service.Shutdown();
     KitOnly kept("kit-park-kept", old);
-    Put(kept.kits + "/kitid-0.16/manifest.json", "kept");
+    Put(kept.kits + "/kitid-abc/manifest.json", "kept");
     Publish(kept.fixture.server, "v0.3.0");
     kept.fixture.server.releases = "[" + kept.fixture.server.latest + "]";
     UpdateService again(kept.Config());
     again.InstallKit();
     Wait(again);
     CHECK(again.Snapshot().kit.phase == KitInstallPhase::kInstalled);
-    CHECK(Read(kept.kits + "/kitid-0.16/manifest.json") == "kept");
+    CHECK(Read(kept.kits + "/kitid-abc/manifest.json") == "kept");
     CHECK(Read(kept.kits + "/.replaced-kitid-1000/manifest.json") == old);
     again.Shutdown();
+    const std::string kit_h = R"({"runtime":{"artifact_revision":"bceed2d-kit-h-r1"}})";
+    KitOnly hashed("kit-park-hash", kit_h);
+    Publish(hashed.fixture.server, "v0.3.0");
+    hashed.fixture.server.releases = "[" + hashed.fixture.server.latest + "]";
+    UpdateService hash_service(hashed.Config());
+    hash_service.InstallKit();
+    Wait(hash_service);
+    CHECK(hash_service.Snapshot().kit.phase == KitInstallPhase::kInstalled);
+    CHECK(Read(hashed.kits + "/kitid-bceed2d/manifest.json") == kit_h);
+    CHECK(!Exists(hashed.kits + "/.replaced-kitid-1000"));
+    hash_service.Shutdown();
+  }
+  // A kit kept for going back is parked by its git hash when a later update would delete it.
+  // The kit this update just replaced stays as .previous-, so going back can still put it back.
+  {
+    Fixture fixture;
+    fixture.root = zip_fixture::TempFolder("previous-hash");
+    Installed(fixture.root);
+    const std::string kits = fixture.root + "/playden/kits";
+    const std::string kept = R"({"runtime":{"artifact_revision":"bceed2d-kit-h-r1"}})";
+    Put(kits + "/.previous-kitid-1/manifest.json", kept);
+    Publish(fixture.server, "v0.3.0");
+    UpdateService service(fixture.Config({0, 2, 0}));
+    service.Install();
+    Wait(service);
+    service.RequestRestart();
+    service.Shutdown();
+    CHECK(service.ApplyAtQuit());
+    CHECK(Read(kits + "/kitid-bceed2d/manifest.json") == kept);
+    CHECK(!Exists(kits + "/.previous-kitid-1"));
+    CHECK(Read(kits + "/.previous-kitid-1000/manifest.json") == std::string(64, 'b'));
+    RemoveTree(fixture.root);
+  }
+  // The hash folder is already there: the .previous kit is removed and that folder is left as it was.
+  {
+    Fixture fixture;
+    fixture.root = zip_fixture::TempFolder("previous-hash-kept");
+    Installed(fixture.root);
+    const std::string kits = fixture.root + "/playden/kits";
+    const std::string kept = R"({"runtime":{"artifact_revision":"bceed2d-kit-h-r1"}})";
+    Put(kits + "/kitid-bceed2d/manifest.json", "kept");
+    Put(kits + "/.previous-kitid-1/manifest.json", kept);
+    Publish(fixture.server, "v0.3.0");
+    UpdateService service(fixture.Config({0, 2, 0}));
+    service.Install();
+    Wait(service);
+    service.RequestRestart();
+    service.Shutdown();
+    CHECK(service.ApplyAtQuit());
+    CHECK(Read(kits + "/kitid-bceed2d/manifest.json") == "kept");
+    CHECK(!Exists(kits + "/.previous-kitid-1"));
+    RemoveTree(fixture.root);
   }
   // Only a missing or older kit is replaced: a newer one (a development kit) or the same version built elsewhere
   // stays, and nothing is downloaded. An older one is offered as before.

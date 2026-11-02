@@ -164,8 +164,9 @@ struct LiveKitInfo {
     std::string version;                   // "0.13", from its runtime's artifact name; empty for older kits
 };
 // A kit that admitted, for the default and per-game pickers. latest_slot is the kit Playden installs.
+// folder is that kit's directory name; empty for the Latest slot.
 struct AdmittedKit {
-    std::string version;
+    std::string folder;
     bool latest_slot = false;
 };
 // Live: Playden's own update (update/update_service.h), projected for Settings, Downloads and prompts.

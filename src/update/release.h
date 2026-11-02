@@ -66,6 +66,10 @@ struct KitVersion {
 std::optional<KitVersion> ParseKitVersion(std::string_view text);
 // The version in a kit's runtime artifact name, "<wine revision>-kit-<version>" ("f729534-kit-0.12").
 std::optional<KitVersion> KitVersionFromArtifact(std::string_view artifact);
+// The git hash in that name: the hex prefix before "-kit-" ("bceed2d" in "bceed2d-kit-h-r1").
+// Empty when the prefix is missing or not a short lowercase hex token.
+std::string ArtifactGitHash(std::string_view artifact);
+bool IsGitHash(std::string_view text);
 
 struct UpdateManifest {
   Version app_version;

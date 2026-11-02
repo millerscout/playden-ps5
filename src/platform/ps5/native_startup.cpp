@@ -2,7 +2,6 @@
 #include "platform/ps5/native_access_posix.h"
 #include "platform/ps5/title_activity.h"
 #include "platform/ps5/title_allow_list.h"
-#include "runtime/kit_catalog.h"
 #include "runtime/kit_trust.h"
 #include "runtime/layout_migration.h"
 #include "runtime/self_heal.h"
@@ -186,9 +185,8 @@ NativeAccessResult PrepareNativeStartup(const std::string& title_id) {
     runtime::TightenKitModes(runtime::kDevelopmentKitRoot, WithRoot, layout_log);
     if (DIR* folder = opendir("/data/playden/kits")) {
       while (const dirent* entry = readdir(folder)) {
-        std::string version;
-        if (runtime::ParkedKitVersion(runtime::kDevelopmentKitId, entry->d_name, &version))
-          runtime::TightenKitModes(std::string("/data/playden/kits/") + entry->d_name, WithRoot, layout_log);
+        if (entry->d_name[0] == '.') continue;
+        runtime::TightenKitModes(std::string("/data/playden/kits/") + entry->d_name, WithRoot, layout_log);
       }
       closedir(folder);
     }

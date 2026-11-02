@@ -493,10 +493,16 @@ void ContentLanguagePersistsAndOlderVersionsStayEnglish() {
         "an unknown game language is saved as English and cannot inject a preference");
   preferences.default_kit = "0.17";
   Check(store.Save(preferences).ok() && store.Load().preferences.default_kit == "0.17",
-        "a kit version survives restart");
-  preferences.default_kit = "not-a-kit";
+        "an old kit version pin survives restart");
+  preferences.default_kit = "my-kit";
+  Check(store.Save(preferences).ok() && store.Load().preferences.default_kit == "my-kit",
+        "a kit folder name survives restart");
+  preferences.default_kit = "kit/name";
   Check(store.Save(preferences).ok() && store.Load().preferences.default_kit == "latest",
-        "a kit pin this build does not understand is saved as latest");
+        "a kit pin with a slash is saved as latest");
+  preferences.default_kit = ".hidden";
+  Check(store.Save(preferences).ok() && store.Load().preferences.default_kit == "latest",
+        "a kit pin with a leading dot is saved as latest");
   const std::string version_ten =
       "version=10\nreduce_motion=0\ntitle_store_suffix=0\ncloud_saves_auto=0\nsteam_sign_in_password=0\n"
       "downloads_slow_network=0\nsteam_stay_signed_in=1\nbeta_updates=0\ndownload_server=\nweb_access=1\n"
@@ -508,10 +514,10 @@ void ContentLanguagePersistsAndOlderVersionsStayEnglish() {
             from_ten.preferences.default_kit == "latest",
         "version 10 preferences load with Latest");
   const std::string version_eleven = version_ten.substr(0, version_ten.size() - 1).replace(0, 10, "version=11") +
-                                      "\ndefault_kit=nope\n";
+                                      "\ndefault_kit=.hidden\n";
   Check(storage.WriteAtomic("preferences.conf", playden::Bytes(version_eleven.begin(), version_eleven.end())).ok(),
         "version 11 fixture is written");
-  Check(store.Load().preferences.default_kit == "latest", "an unknown kit pin loads as Latest");
+  Check(store.Load().preferences.default_kit == "latest", "a kit pin with a leading dot loads as Latest");
   const std::string ten =
       "version=10\nreduce_motion=0\ntitle_store_suffix=0\ncloud_saves_auto=0\nsteam_sign_in_password=0\n"
       "downloads_slow_network=0\nsteam_stay_signed_in=1\nbeta_updates=0\ndownload_server=\nweb_access=1\n";

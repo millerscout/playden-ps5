@@ -96,6 +96,10 @@ public:
   // another build of this one): owner markers that name the install but not the admitted kit.
   // A setup stopped before Ready can't finish over it (cheap marker check).
   virtual bool SetupFromOtherKit(const RuntimeInstall &) { return false; }
+  // Whether Update can refresh this install onto the admitted kit. The markers name this install
+  // and the same kit identity (kit id, template, recipe). A new runtime path or file hash still
+  // counts. False for another kit, or when a marker is missing.
+  virtual bool CompatibleKitIdentity(const RuntimeInstall &) { return false; }
   virtual PackageActionResult WriteTitleMetadata(const RuntimeInstall &, const std::string &,
                                                  const std::optional<std::string> &) {
     return {PackageActionState::kFailed, "unsupported", "title metadata is unsupported"};

@@ -46,9 +46,8 @@ std::string Quote(const std::string& text) {
   return out + "\"";
 }
 
-// The version of the kit in kit_root, from its runtime's artifact name; none for a kit that names none
-// (kits before 0.10) or a manifest that can't be read.
-std::optional<KitVersion> InstalledKitVersion(const std::string& kit_root) {
+// The runtime artifact name in kit_root's manifest, when that file can be read.
+std::optional<std::string> InstalledArtifact(const std::string& kit_root) {
   std::string text;
   if (!ReadSmallFile(kit_root + "/manifest.json", &text, 8 << 20)) return std::nullopt;
   steam::json::Limits limits;
@@ -59,7 +58,34 @@ std::optional<KitVersion> InstalledKitVersion(const std::string& kit_root) {
   const auto* runtime = manifest && manifest->is_object() ? manifest->Find("runtime") : nullptr;
   const auto* artifact = runtime && runtime->is_object() ? runtime->Find("artifact_revision") : nullptr;
   if (!artifact || !artifact->is_string()) return std::nullopt;
-  return KitVersionFromArtifact(artifact->text());
+  return artifact->text();
+}
+
+// The version of the kit in kit_root, from its runtime's artifact name; none for a kit that names none
+// (kits before 0.10) or a manifest that can't be read.
+std::optional<KitVersion> InstalledKitVersion(const std::string& kit_root) {
+  const auto artifact = InstalledArtifact(kit_root);
+  if (!artifact) return std::nullopt;
+  return KitVersionFromArtifact(*artifact);
+}
+
+// The git hash in that artifact ("bceed2d" in "bceed2d-kit-h-r1"). Empty when it has none.
+std::string InstalledKitGitHash(const std::string& kit_root) {
+  const auto artifact = InstalledArtifact(kit_root);
+  return artifact ? ArtifactGitHash(*artifact) : std::string{};
+}
+
+// ".previous-<kit id>-<time>". The id may itself contain hyphens; the time is the trailing digits.
+bool PreviousKitId(std::string_view name, std::string* kit_id) {
+  constexpr std::string_view kPrefix = ".previous-";
+  if (name.size() <= kPrefix.size() || name.compare(0, kPrefix.size(), kPrefix) != 0) return false;
+  const auto body = name.substr(kPrefix.size());
+  const auto dash = body.rfind('-');
+  if (dash == std::string_view::npos || dash == 0 || dash + 1 >= body.size()) return false;
+  for (char c : body.substr(dash + 1))
+    if (c < '0' || c > '9') return false;
+  *kit_id = std::string(body.substr(0, dash));
+  return !kit_id->empty();
 }
 
 std::string Gigabytes(std::uint64_t bytes) {
@@ -956,13 +982,12 @@ void UpdateService::DoInstallKit() {
     if (folder.empty()) return FailKit("The new kit did not pass its check.", "not ready after unpacking");
   }
   if (folder != installed) {
-    // A version Playden can name is parked beside the Latest slot so a game pinned to it can keep
-    // using it. One that cannot be named (kits before 0.10), or a copy of that version already
+    // The outgoing kit is parked beside Latest as <kit id>-<git hash>, so a game pinned to that
+    // folder can keep it. One whose artifact has no git hash, or a copy of that hash already
     // parked, is the ".replaced-" leftover a later start removes.
     std::string aside = config_.kits_root + "/.replaced-" + kit.kit_id + "-" + std::to_string(config_.now());
-    if (const auto version = InstalledKitVersion(installed)) {
-      const std::string parked =
-          config_.kits_root + "/" + runtime::ParkedKitFolder(kit.kit_id, runtime::FormatKitVersion(*version));
+    if (const auto hash = InstalledKitGitHash(installed); !hash.empty()) {
+      const std::string parked = config_.kits_root + "/" + runtime::ParkedKitFolder(kit.kit_id, hash);
       if (!Exists(parked)) aside = parked;
     }
     const bool moved = config_.as_root([&] {
@@ -1180,9 +1205,20 @@ bool UpdateService::ApplyAtQuit() {
     // they go now, as root, while no other thread runs.
     for (const auto& name : ListFolder(config_.work_root + "/backup")) RemoveTree(config_.work_root + "/backup/" + name);
     // Its kit goes too, whether or not this update brings a new one: going back from this update
-    // restores only the kit this update replaces.
-    for (const auto& name : ListFolder(config_.kits_root))
-      if (name.compare(0, 10, ".previous-") == 0) RemoveTree(config_.kits_root + "/" + name);
+    // restores only the kit this update replaces. A kit that names a git hash is parked beside
+    // Latest first, so the selector can still offer it.
+    for (const auto& name : ListFolder(config_.kits_root)) {
+      if (name.compare(0, 10, ".previous-") != 0) continue;
+      const std::string path = config_.kits_root + "/" + name;
+      std::string id;
+      const auto hash = PreviousKitId(name, &id) ? InstalledKitGitHash(path) : std::string{};
+      const std::string parked = hash.empty() ? std::string{} : config_.kits_root + "/" + runtime::ParkedKitFolder(id, hash);
+      if (!parked.empty() && !Exists(parked) && rename(path.c_str(), parked.c_str()) == 0) {
+        Log("previous kit parked as " + parked);
+        continue;
+      }
+      RemoveTree(path);
+    }
     // One transaction: the kit first, then the app; a failed app swap puts the kit back.
     if (!staged_kit_.empty()) {
       if (!Exists(staged_kit_)) {

@@ -33,8 +33,8 @@ struct Preferences {
   // in this language is installed in English, as every game was before this could be chosen.
   std::string content_language = "english";
   // The runtime kit new games use, and games that have not chosen their own. "latest" is the kit
-  // installed at /data/playden/kits/playden-kit. A version ("0.17") is that kit when it is still
-  // installed. Anything else is saved back as "latest".
+  // installed at /data/playden/kits/playden-kit. A folder name is that directory. An old version
+  // ("0.17") is kept, and matches only a directory of that name; otherwise the game uses Latest.
   std::string default_kit = "latest";
 };
 
