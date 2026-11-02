@@ -1279,6 +1279,39 @@ void AppInfoNamesWhyAppsWereNotAnswered() {
                     "http_connections=0 http_ms=0 "
                     "absent=1 http=1 missing_token=1 token_denied=1 unknown=1 http_min_size=2048 "
                     "http_host=cache.example") != std::string::npos);
+  assert(line->find(" session_ms=") != std::string::npos && line->find(" token_ms=") != std::string::npos &&
+         line->find(" pics_ms=") != std::string::npos && line->find(" http_wall_ms=") != std::string::npos &&
+         line->find(" total_ms=") != std::string::npos);
+}
+
+// A batch Steam answers in full still gets one line, with the download phase at zero.
+void AppInfoLogsPhasesWhenEveryAppIsInline() {
+  auto script = std::make_shared<Script>();
+  script->on_logon = {ServerFrame(cm::kEMsgClientLogOnResponse, LogonResponseBody(1, 9))};
+  script->on_emsg[cm::kEMsgClientPICSAccessTokenRequest] = {
+      ServerFrame(cm::kEMsgClientPICSAccessTokenResponse, {}, std::nullopt, 1)};
+  proto::Writer app;
+  app.AddVarint(1, 10);
+  const std::string text = "\"appinfo\" { }";
+  app.AddBytes(5, std::vector<std::uint8_t>(text.begin(), text.end()));
+  proto::Writer response;
+  response.AddMessage(1, app);
+  script->on_emsg[cm::kEMsgClientPICSProductInfoRequest] = {
+      ServerFrame(cm::kEMsgClientPICSProductInfoResponse, response.bytes(), std::nullopt, 2)};
+  std::vector<std::string> lines;
+  SetCmLog([&](const std::string& line) { lines.push_back(line); });
+  auto client = MakeClient(script);
+  std::atomic<bool> cancel{false};
+  const auto result = client.FetchAppInfo(Session(), {10}, cancel);
+  SetCmLog(nullptr);
+  assert(result.ok() && result.buffers.size() == 1 && result.unanswered.empty());
+  const auto line = std::find_if(lines.begin(), lines.end(),
+                                 [](const std::string& entry) { return entry.find("step=app_info ") != std::string::npos; });
+  assert(line != lines.end());
+  assert(line->find("requested=1 answered=1 parts=1 tokens=0 denied=0 offloaded=0") != std::string::npos);
+  assert(line->find(" http_wall_ms=0 ") != std::string::npos);
+  assert(line->find(" session_ms=") != std::string::npos && line->find(" token_ms=") != std::string::npos &&
+         line->find(" pics_ms=") != std::string::npos && line->find(" total_ms=") != std::string::npos);
 }
 
 // A VDF Steam serves only by hash is fetched from the clientconfig host and kept when it matches.
@@ -1626,6 +1659,7 @@ int main(int argc, char** argv) {
   ResetCmBackoff();
   AppInfoUsesAccessTokensAndCollectsMultipartBuffers();
   AppInfoNamesWhyAppsWereNotAnswered();
+  AppInfoLogsPhasesWhenEveryAppIsInline();
   AppInfoFetchesHashOnlyAppsOverHttp();
   ResetCmBackoff();
   DepotAccessReturnsKeysAndManifestCodes();

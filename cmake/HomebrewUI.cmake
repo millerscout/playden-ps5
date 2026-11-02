@@ -273,6 +273,16 @@ target_link_libraries(playden_homebrew_artwork_cache PUBLIC playden_homebrew_art
 
 add_library(playden_homebrew_ui STATIC
     "${CMAKE_SOURCE_DIR}/src/homebrew/view.cpp")
+if(APPLE AND NOT PLAYDEN_PLATFORM_PS5)
+    target_sources(playden_homebrew_ui PRIVATE "${CMAKE_SOURCE_DIR}/src/homebrew/trailer_player.mm")
+    set_source_files_properties("${CMAKE_SOURCE_DIR}/src/homebrew/trailer_player.mm"
+        PROPERTIES COMPILE_OPTIONS "-fobjc-arc")
+    target_link_libraries(playden_homebrew_ui PUBLIC
+        "-framework AVFoundation" "-framework CoreMedia" "-framework CoreVideo"
+        "-framework CoreFoundation" "-framework Foundation")
+else()
+    target_sources(playden_homebrew_ui PRIVATE "${CMAKE_SOURCE_DIR}/src/homebrew/trailer_player.cpp")
+endif()
 target_compile_features(playden_homebrew_ui PUBLIC cxx_std_20)
 target_include_directories(playden_homebrew_ui PUBLIC "${CMAKE_SOURCE_DIR}/src")
 target_link_libraries(playden_homebrew_ui PUBLIC

@@ -32,6 +32,10 @@ struct StoreBrowseItem {
   std::string trailer_thumbnail;
   std::string trailer_url;
   std::uint64_t fetched_at = 0;
+  // True once GetItems or appdetails has answered for screenshots and the trailer, even if both are empty.
+  bool media_known = false;
+  std::string developer;
+  std::string release_date;
   // From GetItems basic_info / controller categories, or filled later from appdetails.
   bool description_known = false;
   std::string description;
@@ -76,11 +80,21 @@ class StoreBrowseService {
   void Request(GameId id);
   // The open game: next after whatever batch is already downloading.
   void RequestFirst(GameId id);
+  // Ids the worker asks for, in order, when the queue has room. Replaces any walk already set.
+  void SetWalk(std::vector<GameId> ids);
+  // Called on the worker after a fetched batch, so the library file is not written on the UI thread.
+  void SetTagSave(std::function<void(std::uint64_t account, std::vector<std::pair<GameId, std::vector<std::string>>>)> save);
+  void SetTagAccount(std::uint64_t account);
+  // True when the background queue already holds kMaxPending games.
+  bool Full();
   // The saved record while it is under kStoreBrowseTtlSeconds, including one that has no description yet.
   std::optional<StoreBrowseItem> Cached(GameId id);
-  // Writes genres onto the saved record. Description and controller support fill in only when absent.
+  // Writes genres onto the saved record. Description, controller support, developer and release date fill in
+  // only when absent. With include_media, empty screenshot and trailer fields take the store page's URLs.
   void RememberDetails(GameId id, std::string description, std::vector<std::string> genres,
-                       std::string controller);
+                       std::string controller, std::vector<std::string> screenshots = {},
+                       std::string trailer_thumbnail = {}, std::string trailer_url = {},
+                       std::string developer = {}, std::string release_date = {}, bool include_media = false);
   std::vector<StoreBrowseItem> Pump(std::size_t maximum = 8);
   void Shutdown();
 
@@ -97,6 +111,8 @@ class StoreBrowseService {
   bool Current(const StoreBrowseItem& item, std::uint64_t now) const;
   bool Fresh(const StoreBrowseItem& item, std::uint64_t now) const;
   void Enqueue(GameId id, bool first);
+  // Moves the next walk ids into the queue. The lock is held. Cache hits become results.
+  void FillWalkLocked(std::uint64_t now);
 
   Fetch fetch_;
   std::chrono::milliseconds pause_;
@@ -105,6 +121,10 @@ class StoreBrowseService {
   std::mutex mutex_;
   std::condition_variable wake_;
   std::deque<GameId> pending_;
+  std::vector<GameId> walk_;
+  std::size_t walk_at_ = 0;
+  std::function<void(std::uint64_t, std::vector<std::pair<GameId, std::vector<std::string>>>)> tag_save_;
+  std::atomic<std::uint64_t> tag_account_{0};
   std::set<GameId> requested_;
   std::deque<StoreBrowseItem> results_;
   std::map<std::uint32_t, StoreBrowseItem> cached_;

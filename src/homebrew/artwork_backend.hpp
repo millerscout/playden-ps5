@@ -39,11 +39,16 @@ class HttpArtworkBackend final : public ArtworkBackend {
   std::optional<ArtworkImage> Load(
       const ArtworkKey&, const std::atomic<bool>& cancel) override;
 
+  // One line per store still: rejected, fetched, cached, or why it did not decode.
+  // Set it before any Load. The artwork worker calls it.
+  void SetLog(std::function<void(const std::string&)> log) { log_ = std::move(log); }
+
   const std::string& cache_dir() const noexcept { return cache_dir_; }
 
  private:
   struct Cache;
   std::string cache_dir_;
+  std::function<void(const std::string&)> log_;
   std::unique_ptr<steam::HttpClient> http_;
   Perform perform_;
   std::unique_ptr<Cache> cache_;

@@ -47,8 +47,8 @@ void tag_chips_filter_the_default_library(const std::filesystem::path& fixtures)
     Simulation simulation(fixtures, temp_profile());
     check(simulation.scenario("default"), "default scenario loads for the tag chips");
     check(simulation.action("details:900001"), "the tagged fixture game opens");
-    check(simulation.action("down") && simulation.state().navigation.focus_key == "detail-tag-0",
-          "Down from the actions focuses the first tag chip");
+    check(simulation.action("up") && simulation.state().navigation.focus_key == "detail-tag-0",
+          "Up from the actions focuses the first tag chip");
     check(simulation.action("right") && simulation.state().navigation.focus_key == "detail-tag-1",
           "Right moves along the tag chips");
     check(simulation.action("cross"), "Cross on a chip filters by that tag");
@@ -136,6 +136,15 @@ void filtering_uses_real_fixture(const std::filesystem::path& fixtures)
           "hiding family sharing leaves the owned games");
     state.library.filters.clear();
     demo.family_shared = false;
+    demo.free = true;
+    const auto without_free = filtered_games(state);
+    check(without_free.size() == every_game - 1 &&
+              std::none_of(without_free.begin(), without_free.end(), [](const Game* game) { return game->free; }),
+          "free games stay hidden with no filter");
+    state.library.filters = {"free"};
+    check(filtered_games(state).size() == every_game, "Free games shows the license-only games");
+    state.library.filters.clear();
+    demo.free = false;
     auto& tagged = *std::find_if(state.games.begin(), state.games.end(),
                                  [](const Game& game) { return game.id == SteamId(900001); });
     tagged.store_tags = {"Roguelike", "Adventure"};

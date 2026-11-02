@@ -181,6 +181,11 @@ void InvalidHttpIdentityIsRejectedWithoutTransport() {
   assert(!backend.Load({1, SteamId(42), "https://cdn.cloudflare.steamstatic.com/steam/apps/41/library_hero.jpg"}, cancel));
   assert(!backend.Load({1, SteamId(42), "https://cdn.cloudflare.steamstatic.com/steam/apps/41/logo.png"}, cancel));
   assert(!backend.Load({1, SteamId(42), "https://cdn.cloudflare.steamstatic.com/steam/apps/42/header.jpg"}, cancel));
+  assert(!backend.Load({1, SteamId(42), "https://evil.example/store_item_assets/steam/apps/42/ss.600x338.jpg"}, cancel));
+  assert(!backend.Load({1, SteamId(42), "http://shared.akamai.steamstatic.com/store_item_assets/steam/apps/42/ss.jpg"}, cancel));
+  assert(!backend.Load({1, SteamId(42), "https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/42/clip.mp4"}, cancel));
+  assert(!backend.Load({1, SteamId(42), "https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/42/../ss.jpg"}, cancel));
+  assert(!backend.Load({1, SteamId(42), "https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/42/ss.jpg?x=1"}, cancel));
 }
 
 // A private cache folder under a temporary root, removed on exit.
@@ -393,6 +398,43 @@ void BadDownloadKeepsTheCachedCover() {
     assert(entry.path().filename() == "42_600x900.jpg");  // no temporary file left behind
 }
 
+void StoreStillIsFetchedAndCached() {
+  CacheFolder folder;
+  FakeCdn cdn;
+  cdn.answer = [](const std::string&) { return Status(200, SmallJpeg()); };
+  HttpArtworkBackend backend(cdn.perform(), folder.art.string());
+  std::vector<std::string> lines;
+  backend.SetLog([&](const std::string& line) { lines.push_back(line); });
+  std::atomic<bool> cancel{false};
+  const char* still =
+      "https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/730/"
+      "9c8b8fd6ebb2c84a1c38541369e6c05db7f1fbe0/"
+      "ss_9c8b8fd6ebb2c84a1c38541369e6c05db7f1fbe0.600x338.jpg?t=5";
+  const auto image = backend.Load({1, SteamId(42), still}, cancel);
+  assert(image && image->width == 2 && image->height == 1);
+  assert(cdn.urls.size() == 1 && cdn.urls[0] == still);
+  assert(lines.size() == 1 && lines[0].find("still ok 2x1") == 0);
+  int files = 0;
+  for (const auto& entry : std::filesystem::directory_iterator(folder.art)) {
+    ++files;
+    const auto name = entry.path().filename().string();
+    assert(name.rfind("42_", 0) == 0 && name.size() > 4 && name.substr(name.size() - 4) == ".jpg");
+    assert(name != "42_600x900.jpg" && name != "42_hero.jpg" && name != "42_logo.png");
+  }
+  assert(files == 1);
+
+  cdn.urls.clear();
+  HttpArtworkBackend again(cdn.perform(), folder.art.string());
+  assert(again.Load({1, SteamId(42), still}, cancel));
+  assert(cdn.urls.empty());
+
+  // A trailer poster is filed under the movie id, not the game id.
+  const char* poster =
+      "https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/5787/movie.293x165.jpg?t=5";
+  assert(backend.Load({1, SteamId(42), poster}, cancel));
+  assert(cdn.urls.size() == 1 && cdn.urls[0] == poster);
+}
+
 void ExpiredCacheIsReplacedByANewCover() {
   CacheFolder folder;
   folder.Write("42_600x900.jpg", SmallJpeg(), true);
@@ -432,5 +474,6 @@ int main(int argc, char** argv) {
   HeroHasNoHeaderFallback();
   OtherFailuresKeepTheCachedCover();
   BadDownloadKeepsTheCachedCover();
+  StoreStillIsFetchedAndCached();
   ExpiredCacheIsReplacedByANewCover();
 }

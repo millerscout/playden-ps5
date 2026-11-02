@@ -1276,6 +1276,7 @@ void Simulation::open_game_page(GameId id) {
     state_.navigation.detail_id = id;
     state_.navigation.selected_game_id = id;
     state_.navigation.route = Route::Details;
+    state_.navigation.detail_trailer_playing = false;
     details_primary_pending_ = live();
     state_.navigation.focus_key = live() ? "details-favorite" : "details-play";
 }
@@ -3458,13 +3459,31 @@ bool Simulation::UpdateAppDetails(GameId id, std::optional<std::uint64_t> downlo
 }
 
 void Simulation::UpdateStoreDetails(GameId id, std::string description, std::vector<std::string> genres,
-                                    std::vector<std::string> tags, std::string controller_support) {
+                                    std::vector<std::string> tags, std::string controller_support,
+                                    std::vector<std::string> screenshots, std::string trailer_thumbnail,
+                                    std::string trailer_url, std::string developer, std::string release_date,
+                                    bool include_media) {
     if (!live()) return;
+    auto https = [](const std::string& url) {
+        return !url.empty() && url.size() <= 512 && url.rfind("https://", 0) == 0;
+    };
     auto& facts = store_facts_[id];
     if (!description.empty()) facts.description = std::move(description);
     facts.genres = std::move(genres);
     if (!tags.empty()) facts.tags = std::move(tags);
     if (!controller_support.empty()) facts.controller_support = std::move(controller_support);
+    if (include_media) {
+        facts.screenshots.clear();
+        for (auto& url : screenshots) {
+            if (facts.screenshots.size() >= 4 || !https(url)) continue;
+            facts.screenshots.push_back(std::move(url));
+        }
+        facts.trailer_thumbnail = https(trailer_thumbnail) ? std::move(trailer_thumbnail) : std::string();
+        facts.trailer_url = https(trailer_url) ? std::move(trailer_url) : std::string();
+        facts.media_known = true;
+    }
+    if (!developer.empty() && developer.size() <= 128) facts.developer = std::move(developer);
+    if (!release_date.empty() && release_date.size() <= 64) facts.release_date = std::move(release_date);
     for (auto& game : state_.games) {
         if (game.id != id) continue;
         if (!facts.description.empty()) game.description = facts.description;
@@ -3474,6 +3493,14 @@ void Simulation::UpdateStoreDetails(GameId id, std::string description, std::vec
             game.store_tags_known = true;
         }
         if (!facts.controller_support.empty()) game.controller_support = facts.controller_support;
+        if (facts.media_known) {
+            game.store_screenshots = facts.screenshots;
+            game.store_trailer_thumbnail = facts.trailer_thumbnail;
+            game.store_trailer_url = facts.trailer_url;
+            game.store_media_known = true;
+        }
+        if (!facts.developer.empty()) game.store_developer = facts.developer;
+        if (!facts.release_date.empty()) game.store_release_date = facts.release_date;
     }
     rebuild_view();
 }
@@ -3496,10 +3523,13 @@ bool Simulation::UpdateStoreTags(GameId id, std::vector<std::string> tags) {
 
 void Simulation::UpdateStoreBrowse(std::vector<StoreBrowseUpdate> updates) {
     if (!live() || updates.empty()) return;
-    bool applied = false;
+    std::vector<GameId> touched;
     for (auto& update : updates) {
         if (!update.id.valid() || update.tags.size() > 32 || update.screenshots.size() > 4) continue;
-        if (update.trailer_thumbnail.size() > 512 || update.description.size() > 4096 || update.genres.size() > 8) continue;
+        if (update.trailer_thumbnail.size() > 512 || update.trailer_url.size() > 512 ||
+            update.description.size() > 4096 || update.genres.size() > 8 || update.developer.size() > 128 ||
+            update.release_date.size() > 64)
+            continue;
         bool valid = true;
         for (const auto& genre : update.genres)
             if (genre.empty() || genre.size() > 64) valid = false;
@@ -3508,14 +3538,18 @@ void Simulation::UpdateStoreBrowse(std::vector<StoreBrowseUpdate> updates) {
         for (const auto& url : update.screenshots)
             if (url.empty() || url.size() > 512 || url.rfind("https://", 0) != 0) valid = false;
         if (!update.trailer_thumbnail.empty() && update.trailer_thumbnail.rfind("https://", 0) != 0) valid = false;
+        if (!update.trailer_url.empty() && update.trailer_url.rfind("https://", 0) != 0) valid = false;
         if (!valid) continue;
         auto& facts = store_facts_[update.id];
         if (update.tags_known) facts.tags = update.tags;
         if (update.include_media) {
             facts.screenshots = std::move(update.screenshots);
             facts.trailer_thumbnail = std::move(update.trailer_thumbnail);
+            facts.trailer_url = std::move(update.trailer_url);
             facts.media_known = true;
         }
+        if (!update.developer.empty()) facts.developer = std::move(update.developer);
+        if (!update.release_date.empty()) facts.release_date = std::move(update.release_date);
         if (update.description_known && !update.description.empty()) facts.description = std::move(update.description);
         if (!update.controller_support.empty()) facts.controller_support = std::move(update.controller_support);
         if (update.genres_known) facts.genres = std::move(update.genres);
@@ -3528,15 +3562,46 @@ void Simulation::UpdateStoreBrowse(std::vector<StoreBrowseUpdate> updates) {
             if (update.include_media) {
                 game.store_screenshots = facts.screenshots;
                 game.store_trailer_thumbnail = facts.trailer_thumbnail;
+                game.store_trailer_url = facts.trailer_url;
                 game.store_media_known = true;
             }
+            if (!facts.developer.empty()) game.store_developer = facts.developer;
+            if (!facts.release_date.empty()) game.store_release_date = facts.release_date;
             if (!facts.description.empty()) game.description = facts.description;
             if (!facts.controller_support.empty()) game.controller_support = facts.controller_support;
             if (update.genres_known) game.genres = facts.genres;
-            applied = true;
+            touched.push_back(update.id);
         }
     }
-    if (applied) rebuild_view();
+    const bool tags_matter = !state_.library.tag_filters.empty() || !state_.library.query.empty() ||
+                             state_.library.filters.contains("genre-adventure") ||
+                             state_.library.filters.contains("controller-full");
+    if (tags_matter && !touched.empty()) ++library_filter_epoch_;
+    if (touched.empty()) return;
+    std::set<GameId> shown;
+    const auto route = state_.navigation.route;
+    if (route == Route::Library) {
+        const auto visible = visible_games();
+        if (!visible.empty()) {
+            const std::size_t window = 24;
+            const std::size_t selected = static_cast<std::size_t>(std::max(0, state_.navigation.selected_index));
+            const std::size_t first = visible.size() <= window
+                                          ? 0
+                                          : std::min(selected > window / 2 ? selected - window / 2 : 0, visible.size() - window);
+            const std::size_t end = std::min(visible.size(), first + window);
+            for (std::size_t index = first; index < end; ++index) shown.insert(visible[index]->id);
+        }
+    }
+    if ((route == Route::Details || route == Route::Session) && state_.navigation.detail_id)
+        shown.insert(*state_.navigation.detail_id);
+    if (route == Route::Home)
+        for (const auto& shelf : playden::homebrew::shelves(state_))
+            for (const auto id : shelf.game_ids) shown.insert(id);
+    for (const auto& id : touched)
+        if (shown.contains(id)) {
+            rebuild_view();
+            return;
+        }
 }
 
 bool Simulation::UpdateLibrary(LibraryUpdate update) {
@@ -3605,8 +3670,11 @@ bool Simulation::UpdateLibrary(LibraryUpdate update) {
                 if (facts->second.media_known) {
                     game.store_screenshots = facts->second.screenshots;
                     game.store_trailer_thumbnail = facts->second.trailer_thumbnail;
+                    game.store_trailer_url = facts->second.trailer_url;
                     game.store_media_known = true;
                 }
+                if (!facts->second.developer.empty()) game.store_developer = facts->second.developer;
+                if (!facts->second.release_date.empty()) game.store_release_date = facts->second.release_date;
             }
             projected.push_back(std::move(game));
         }
@@ -5432,20 +5500,71 @@ bool Simulation::scenario(const std::string& name) {
     return true;
 }
 
+bool Simulation::library_index_current() const {
+    if (!library_index_valid_) return false;
+    const bool searching = state_.editor.active && state_.editor.purpose == "Search";
+    const std::string& query = searching ? state_.editor.value : state_.library.query;
+    const auto& sort = state_.library.view_sort.empty() ? state_.library.sort : state_.library.view_sort;
+    std::size_t members = 0;
+    for (const auto& collection : state_.library.collections)
+        if (collection.id == state_.library.scope) members = collection.members.size();
+    const auto auth = static_cast<int>(state_.account().authentication);
+    const std::size_t installs = state_.installations.size() + state_.external_games.size() + state_.library.ratings.size();
+    return library_index_data_ == state_.games.data() && library_index_size_ == state_.games.size() &&
+           library_index_query_ == query && library_index_scope_ == state_.library.scope &&
+           library_index_sort_ == sort && library_index_filters_ == state_.library.filters &&
+           library_index_tags_ == state_.library.tag_filters && library_index_hidden_ == state_.library.hidden &&
+           library_index_favorites_ == state_.library.favorites && library_index_members_ == members &&
+           library_index_installs_ == installs && library_index_auth_ == auth &&
+           library_index_cache_ == state_.account().cache_available &&
+           library_index_epoch_ == library_filter_epoch_;
+}
+
+std::vector<const Game*> Simulation::cached_visible_games() const {
+    if (!library_index_current()) return {};
+    return library_index_;
+}
+
 std::vector<const Game*> Simulation::visible_games() const {
-    if (state_.editor.active && state_.editor.purpose == "Search") {
+    if (library_index_current()) return library_index_;
+    const bool searching = state_.editor.active && state_.editor.purpose == "Search";
+    const std::string& query = searching ? state_.editor.value : state_.library.query;
+    const auto& sort = state_.library.view_sort.empty() ? state_.library.sort : state_.library.view_sort;
+    std::size_t members = 0;
+    for (const auto& collection : state_.library.collections)
+        if (collection.id == state_.library.scope) members = collection.members.size();
+    const auto auth = static_cast<int>(state_.account().authentication);
+    const std::size_t installs = state_.installations.size() + state_.external_games.size() + state_.library.ratings.size();
+
+    if (searching) {
         auto preview = state_;
         preview.library.query = state_.editor.value;
         const auto filtered = filtered_games(preview);
-        std::vector<const Game*> result;
-        result.reserve(filtered.size());
+        library_index_.clear();
+        library_index_.reserve(filtered.size());
         for (const auto* game : filtered) {
             const auto index = static_cast<std::size_t>(game - preview.games.data());
-            result.push_back(&state_.games[index]);
+            library_index_.push_back(&state_.games[index]);
         }
-        return result;
+    } else {
+        library_index_ = filtered_games(state_);
     }
-    return filtered_games(state_);
+    library_index_data_ = state_.games.data();
+    library_index_size_ = state_.games.size();
+    library_index_query_ = query;
+    library_index_scope_ = state_.library.scope;
+    library_index_sort_ = sort;
+    library_index_filters_ = state_.library.filters;
+    library_index_tags_ = state_.library.tag_filters;
+    library_index_hidden_ = state_.library.hidden;
+    library_index_favorites_ = state_.library.favorites;
+    library_index_members_ = members;
+    library_index_installs_ = installs;
+    library_index_auth_ = auth;
+    library_index_cache_ = state_.account().cache_available;
+    library_index_epoch_ = library_filter_epoch_;
+    library_index_valid_ = true;
+    return library_index_;
 }
 
 void Simulation::rebuild_view() {
@@ -7033,12 +7152,21 @@ void Simulation::rebuild_view() {
         }
         if (detail_tag_names_.size() > shown)
             row("detail-tags-more", RowKind::Action, "+" + std::to_string(detail_tag_names_.size() - shown), "detail-tags-more");
+        if (game) {
+            const auto stills = detail_stills(*game);
+            for (std::size_t index = 0; index < stills.size(); ++index)
+                row("details-media-" + std::to_string(index), RowKind::Action, stills[index].trailer ? "Trailer" : "Screenshot",
+                    "details-media");
+        }
         row("details-favorite", RowKind::Toggle, "Favorite", "favorite").selected = game && state_.library.favorites.contains(game->id);
         if (!live()) row("details-simulate-launch", RowKind::Action, "Simulate launch", "launch");
         row("details-more", RowKind::Action, "More", "context");
-        view_.legends = detail_tag_names_.empty()
-            ? std::vector<std::string>{"Cross Select", "Options Actions", "Circle Back"}
-            : std::vector<std::string>{"Cross Select", "Down Tags", "Options Actions", "Circle Back"};
+        const bool media_row = std::any_of(view_.rows.begin(), view_.rows.end(),
+                                           [](const ViewRow& item) { return DetailMediaKey(item.key); });
+        view_.legends = {"Cross Select"};
+        if (!detail_tag_names_.empty()) view_.legends.push_back("Up Tags");
+        if (media_row) view_.legends.push_back("Down Images");
+        view_.legends.insert(view_.legends.end(), {"Options Actions", "Circle Back"});
     } else if (state_.navigation.route == Route::Downloads) {
         // Queue: Downloads, then Preparation, one expanded at a time, then the drives. Rows come in screen
         // order (heading, card, the expanded section's rows), so Up and Down follow what is on screen.
@@ -7534,7 +7662,7 @@ void Simulation::rebuild_view() {
     if (details_primary_pending_ && state_.navigation.route == Route::Details && !has_overlay) {
         // Never a destructive action (Delete saves): a second Cross must not land on it.
         const auto first = std::find_if(view_.rows.begin(), view_.rows.end(), [](const ViewRow& item) {
-            return item.enabled && !item.dangerous && !DetailChipKey(item.key) &&
+            return item.enabled && !item.dangerous && !DetailChipKey(item.key) && !DetailMediaKey(item.key) &&
                    (item.kind == RowKind::Action || item.kind == RowKind::Toggle);
         });
         if (first != view_.rows.end()) state_.navigation.focus_key = first->key;
@@ -8135,6 +8263,7 @@ void Simulation::cancel() {
         state_.navigation.route = Route::Saves;
         state_.navigation.focus_key = "save-" + ToKey(state_.navigation.save_id);
     } else if (state_.navigation.route == Route::Details || state_.navigation.route == Route::Session) {
+        state_.navigation.detail_trailer_playing = false;
         state_.navigation.route = state_.navigation.route == Route::Session ? Route::Details : state_.navigation.detail_origin;
         state_.navigation.focus_key = state_.navigation.route == Route::Details ? "details-play" : game_key(state_.navigation.selected_game_id);
         if (state_.navigation.route == Route::Downloads && !queue_return_focus_.empty()) state_.navigation.focus_key = queue_return_focus_;
@@ -8377,48 +8506,73 @@ void Simulation::move_content(int delta_x, int delta_y) {
     const int columns = state_.navigation.route == Route::Library ? 6 : 1;
     const int delta = delta_y != 0 ? delta_y * columns : delta_x;
     if (view_.rows.empty()) return;
-    // The game page keeps Play and Favorite on one row. Down from there enters the tag chips;
-    // Left and Right move along the row that has focus, and Up from a chip returns to the action.
+    // The game page follows the column: tags, then Install and the other buttons, then the
+    // filmstrip. Left and Right stay on that row. Up from the buttons reaches the tags, and Down
+    // reaches the images. Up from the tags is the tab bar.
     if (state_.navigation.route == Route::Details && (delta_x != 0 || delta_y != 0)) {
         const auto tag_row = [](const ViewRow& item) { return DetailChipKey(item.key); };
+        const auto media_row = [](const ViewRow& item) { return DetailMediaKey(item.key); };
         const auto action_row = [&](const ViewRow& item) {
-            return (item.kind == RowKind::Action || item.kind == RowKind::Toggle) && !tag_row(item);
+            return (item.kind == RowKind::Action || item.kind == RowKind::Toggle) && !tag_row(item) && !media_row(item);
         };
         const int last = static_cast<int>(view_.rows.size()) - 1;
         const int current = std::clamp(view_.focused_row, 0, last);
         const bool on_tag = tag_row(view_.rows[static_cast<std::size_t>(current)]);
+        const bool on_media = media_row(view_.rows[static_cast<std::size_t>(current)]);
         const auto step_among = [&](const auto& wanted, int step) {
             if (step == 0) return current;
             for (int next = current + step; next >= 0 && next <= last; next += step)
                 if (wanted(view_.rows[static_cast<std::size_t>(next)])) return next;
             return current;
         };
-        int target = current;
-        if (!on_tag) {
-            if (delta_x != 0) target = step_among(action_row, delta_x);
-            else if (delta_y > 0)
-                for (int next = 0; next <= last; ++next)
-                    if (tag_row(view_.rows[static_cast<std::size_t>(next)])) {
-                        if (action_row(view_.rows[static_cast<std::size_t>(current)]))
-                            details_action_focus_ = view_.rows[static_cast<std::size_t>(current)].key;
-                        target = next;
-                        break;
-                    }
-        } else if (delta_x != 0) {
-            target = step_among(tag_row, delta_x);
-        } else if (delta_y < 0) {
+        const auto first_where = [&](const auto& wanted) {
+            for (int next = 0; next <= last; ++next)
+                if (wanted(view_.rows[static_cast<std::size_t>(next)])) return next;
+            return -1;
+        };
+        const auto return_to_action = [&] {
             if (!details_action_focus_.empty())
                 for (int next = 0; next <= last; ++next)
                     if (view_.rows[static_cast<std::size_t>(next)].key == details_action_focus_ &&
-                        action_row(view_.rows[static_cast<std::size_t>(next)])) {
-                        target = next;
-                        break;
-                    }
-            if (target == current)
-                for (int next = 0; next <= last; ++next)
-                    if (action_row(view_.rows[static_cast<std::size_t>(next)])) { target = next; break; }
+                        action_row(view_.rows[static_cast<std::size_t>(next)]))
+                        return next;
+            const int action = first_where(action_row);
+            return action >= 0 ? action : current;
+        };
+        const auto remember_action = [&] {
+            if (action_row(view_.rows[static_cast<std::size_t>(current)]))
+                details_action_focus_ = view_.rows[static_cast<std::size_t>(current)].key;
+        };
+        int target = current;
+        if (on_tag) {
+            if (delta_x != 0) target = step_among(tag_row, delta_x);
+            else if (delta_y > 0) target = return_to_action();
+        } else if (on_media) {
+            if (delta_x != 0) target = step_among(media_row, delta_x);
+            else if (delta_y < 0) target = return_to_action();
+        } else if (delta_x != 0) {
+            target = step_among(action_row, delta_x);
+        } else if (delta_y < 0) {
+            const int tag = first_where(tag_row);
+            if (tag >= 0) {
+                remember_action();
+                target = tag;
+            }
+        } else if (delta_y > 0) {
+            const int media = first_where(media_row);
+            if (media >= 0) {
+                remember_action();
+                target = media;
+            }
         }
         if (target == current) return;
+        if (on_media && media_row(view_.rows[static_cast<std::size_t>(target)])) {
+            const auto* game = find_game(state_, state_.navigation.detail_id.value_or(state_.navigation.selected_game_id));
+            const auto stills = game == nullptr ? std::vector<DetailStill>{} : detail_stills(*game);
+            const auto index = DetailMediaIndex(view_.rows[static_cast<std::size_t>(target)].key);
+            if (!index || *index >= stills.size() || !stills[*index].trailer)
+                state_.navigation.detail_trailer_playing = false;
+        }
         state_.navigation.selected_index = target;
         state_.navigation.focus_key = view_.rows[static_cast<std::size_t>(target)].key;
         return;
@@ -9947,6 +10101,19 @@ void Simulation::activate() {
         close_modal();
         reconcile_library_selection(state_);
         save_profile();
+    } else if (action_name == "details-media") {
+#if !defined(PLAYDEN_PLATFORM_PS5)
+        // Cross on the trailer still plays its mp4. A screenshot, or a file that is not on the
+        // Steam CDN, only chooses the still.
+        const auto* game = find_game(state_, state_.navigation.detail_id.value_or(state_.navigation.selected_game_id));
+        const auto stills = game == nullptr ? std::vector<DetailStill>{} : detail_stills(*game);
+        const auto index = DetailMediaIndex(state_.navigation.focus_key);
+        if (game != nullptr && index && *index < stills.size() && stills[*index].trailer &&
+            !PlayableTrailerUrl(game->store_trailer_url).empty())
+            state_.navigation.detail_trailer_playing = !state_.navigation.detail_trailer_playing;
+        else
+            state_.navigation.detail_trailer_playing = false;
+#endif
     } else if (action_name == "detail-tags-more") {
         open_game_tags();
         return;
@@ -10036,6 +10203,8 @@ void Simulation::activate() {
             heading = "Reset settings?";
             body = "Your changes to " + title + "'s settings are removed. The chosen preset and program stay; saves are not touched.";
         } else if (action_name == "maintenance-update") {
+            const auto runtime = state_.runtime_games.find(game);
+            if (runtime != state_.runtime_games.end() && runtime->second.setup_other_kit) return;
             heading = "Update the runtime?";
             body = title + " moves to the installed runtime kit, and settings that need it apply. "
                    "The game doesn't start; saves are not touched.";
@@ -10672,7 +10841,7 @@ bool Simulation::action(const std::string& logical_action) {
         auto& offset = state_.navigation.scroll_offsets["details-content"];
         const auto* game = find_game(state_, state_.navigation.detail_id.value_or(state_.navigation.selected_game_id));
         const auto page = DetailsDescriptionPage(state_.simulation_mode);
-        const int last_page = game ? std::max(0, static_cast<int>((game->description.size() + page - 1) / page) - 1) : 0;
+        const int last_page = game ? DescriptionPageCount(game->description, page) - 1 : 0;
         offset = std::clamp(offset + (logical_action == "l2" ? -1 : 1), 0, last_page);
         rebuild_view(); return true;
     }

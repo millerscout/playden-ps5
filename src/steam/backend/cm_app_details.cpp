@@ -177,17 +177,18 @@ std::vector<AppDetails> CmAppDetailsSource::Fetch(const StoredSession& session,
   const auto ms = std::to_string(
       std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - started).count());
   std::vector<AppDetails> result;
+  const auto detail = [&](std::int64_t dlc_ms, std::size_t dlc) {
+    return "batch=" + std::to_string(app_ids.size()) + " ms=" + ms + " dlc_ms=" + std::to_string(dlc_ms) + " dlc=" + std::to_string(dlc);
+  };
   if (!fetched.ok()) {
-    if (log_) for (const auto id : app_ids) log_(id, "details", "failed", "batch=" + std::to_string(app_ids.size()) + " ms=" + ms);
+    if (log_) for (const auto id : app_ids) log_(id, "details", "failed", detail(0, 0));
     return result;  // the service reports these as retryable
   }
-  if (log_)
-    for (const auto id : app_ids)
-      log_(id, "details", fetched.buffers.count(id) ? "ok" : "missing", "batch=" + std::to_string(app_ids.size()) + " ms=" + ms);
   const auto language = language_ ? language_() : std::string(kDefaultContentLanguage);
   for (const auto id : apps) {
     const auto found = fetched.buffers.find(id);
     if (found == fetched.buffers.end()) {
+      if (log_) log_(id, "details", "missing", detail(0, 0));
       AppDetails missing;
       missing.id = GameId::Steam(id);
       missing.reason = "Steam has no details for this game.";
@@ -198,8 +199,14 @@ std::vector<AppDetails> CmAppDetailsSource::Fetch(const StoredSession& session,
     // An installed game's DLC apps list depots of their own: an update selects them too. A batch Steam
     // doesn't answer only leaves those DLC out of the comparison.
     std::vector<AppInfo> dlc_apps;
-    if (record && !record->depots.empty()) dlc_apps = FetchDlcApps(client_, session, id, found->second, cancel);
+    std::int64_t dlc_ms = 0;
+    if (record && !record->depots.empty()) {
+      const auto dlc_started = std::chrono::steady_clock::now();
+      dlc_apps = FetchDlcApps(client_, session, id, found->second, cancel);
+      dlc_ms = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - dlc_started).count();
+    }
     if (cancel.load()) return {};
+    if (log_) log_(id, "details", "ok", detail(dlc_ms, dlc_apps.size()));
     result.push_back(DetailsFromAppInfo(id, found->second, licensed_ ? licensed_->Get(session.steam_id) : std::nullopt, language, record,
                                         dlc_apps));
   }

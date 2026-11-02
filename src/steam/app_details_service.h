@@ -4,9 +4,11 @@
 #include "steam/session_store.h"
 
 #include <atomic>
+#include <chrono>
 #include <condition_variable>
 #include <cstdint>
 #include <deque>
+#include <functional>
 #include <map>
 #include <memory>
 #include <mutex>
@@ -169,6 +171,9 @@ class AppDetailsService {
   // asked twice. False when it can't be queued (stopping, or kMaxPending of its kind already wait).
   bool Measure(SizeRequest request, std::uint64_t account_generation);
   std::vector<MeasuredSize> PumpMeasured();
+  // One line per batch the worker fetches: `step=details-queue count=N queue_ms=N fetch_ms=N`.
+  // `queue_ms` is the longest wait in the batch from enqueue until Fetch starts. Null stays silent.
+  void SetLog(std::function<void(const std::string&)> log);
   void Shutdown();
 
   static constexpr std::size_t kMaxPending = 64;
@@ -179,23 +184,29 @@ class AppDetailsService {
   void RunMeasures();
   void Reset(std::uint64_t account_generation);  // mutex_ held
 
+  struct QueuedGame {
+    GameId id;
+    std::chrono::steady_clock::time_point enqueued;
+  };
+
   AppDetailsSource& source_;
   SessionRepository& sessions_;
   std::mutex mutex_;
   std::condition_variable wake_;
   std::uint64_t generation_ = 0;
-  std::deque<GameId> pending_;
+  std::deque<QueuedGame> pending_;
   std::set<GameId> requested_;  // queued, in flight or answered for this generation
   // Each answer with the check that asked for it (check_serial_ then), 0 for a page's: only the running
   // check's own answers count for it.
   std::deque<std::pair<AppDetails, std::uint64_t>> results_;
-  std::deque<GameId> check_pending_;  // the installed check's games not yet asked
+  std::deque<QueuedGame> check_pending_;  // the installed check's games not yet asked
   std::set<GameId> check_waiting_;    // asked by the check, not yet handed out by Pump
   InstalledCheck check_;
   std::uint64_t check_serial_ = 0;  // counts the checks started
   std::deque<SizeRequest> measure_pending_;
   std::set<SizeRequest> measure_requested_;  // queued or in flight
   std::deque<MeasuredSize> measured_;
+  std::function<void(const std::string&)> log_;
   std::atomic<bool> cancel_{false};
   std::atomic<bool> measure_cancel_{false};
   bool stopping_ = false;

@@ -26,6 +26,7 @@
 #include <memory>
 #include <optional>
 #include <set>
+#include <vector>
 
 namespace playden::steam {
 class LicensedDepots;
@@ -58,6 +59,8 @@ class Controller {
   // Steam store descriptions, genres and controller support for the games the player opens.
   void SetStoreDetails(steam::StoreDetailsService* store_details) { store_details_ = store_details; }
   void SetStoreBrowse(steam::StoreBrowseService* store_browse) { store_browse_ = store_browse; }
+  // Screenshot and trailer URLs for the open game page, written when that page asks for them.
+  void SetStoreMediaLog(std::function<void(const std::string&)> log) { store_media_log_ = std::move(log); }
   void SetLibraryCache(playden::LibraryCache* library_cache) { library_cache_ = library_cache; }
   // The server list and measurements run on their own worker; only their public snapshot enters the UI.
   void SetDownloadServers(steam::DownloadServerService* servers) { download_servers_ = servers; }
@@ -122,9 +125,18 @@ class Controller {
               const steam::SteamEvent* prompt = nullptr, bool storage_full = false, bool restoring = false);
   void TickAppDetails();
   void TickStoreDetails();
+  void LogStoreMedia(const GameId& id, const char* where, const std::vector<std::string>& shots,
+                     const std::string& thumb, const std::string& video);
   void TickStoreTags();
   steam::StoreDetailsService* store_details_ = nullptr;
   steam::StoreBrowseService* store_browse_ = nullptr;
+  const Game* store_walk_games_ = nullptr;
+  std::size_t store_walk_count_ = 0;
+  bool store_walk_shows_free_ = false;
+  bool store_tags_hooked_ = false;
+  std::vector<GameId> store_priority_ids_;
+  std::chrono::steady_clock::time_point store_priority_at_{};
+  bool store_priority_sent_ = false;
   playden::LibraryCache* library_cache_ = nullptr;
   std::uint64_t steam_account_id_ = 0;
   std::optional<GameId> requested_store_detail_;
@@ -138,6 +150,7 @@ class Controller {
   std::optional<LiveDownloadServers> shown_download_servers_;
   void TickSelfUpdate();
   void TickLicenseChanges();
+  std::function<void(const std::string&)> store_media_log_;
   std::function<void(const std::string&)> shutdown_log_;
   std::function<void(const std::string&)> persistence_log_;
   std::function<void(bool)> stay_signed_in_;

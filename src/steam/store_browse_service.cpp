@@ -19,10 +19,12 @@ constexpr std::size_t kMaximumUrlBytes = 512;
 constexpr std::size_t kMaximumDescriptionBytes = 4096;
 constexpr std::size_t kMaximumGenres = 8;
 constexpr std::size_t kMaximumGenreBytes = 64;
+constexpr std::size_t kMaximumDeveloperBytes = 128;
+constexpr std::size_t kMaximumReleaseBytes = 64;
 constexpr std::size_t kMaxBrowseBytes = 16 * 1024 * 1024;
 constexpr std::size_t kMaxCachedApps = 20000;
 constexpr const char* kBrowsePath = "store-browse.cache";
-const Bytes kBrowseMagic = {'P', 'D', 'N', 'S', 'T', 'B', 0, 3};
+const Bytes kBrowseMagic = {'P', 'D', 'N', 'S', 'T', 'B', 0, 4};
 
 bool ValidTag(std::string_view tag) {
   return !tag.empty() && tag.size() <= kMaximumTagBytes && tag.find('\0') == std::string_view::npos;
@@ -38,6 +40,53 @@ bool ValidGenre(std::string_view genre) {
 
 bool ValidController(std::string_view support) {
   return support.empty() || support == "full" || support == "partial";
+}
+
+bool ValidIdentity(std::string_view text, std::size_t maximum) {
+  return text.size() <= maximum && text.find('\0') == std::string_view::npos;
+}
+
+// Steam's CDN names a resized image "file.600x338.jpg". A bare "file.jpg" is the original, often too large to decode.
+bool HasSizeToken(std::string_view url) {
+  const auto query = url.find('?');
+  const auto path = url.substr(0, query);
+  for (std::size_t start = 0; start < path.size(); ++start) {
+    if (path[start] < '0' || path[start] > '9') continue;
+    std::size_t width = start;
+    while (width < path.size() && path[width] >= '0' && path[width] <= '9') ++width;
+    if (width == start || width >= path.size() || path[width] != 'x') continue;
+    std::size_t height = width + 1;
+    if (height >= path.size() || path[height] < '0' || path[height] > '9') continue;
+    while (height < path.size() && path[height] >= '0' && path[height] <= '9') ++height;
+    if (height > width + 1) return true;
+  }
+  return false;
+}
+
+bool JpegPath(std::string_view path) {
+  auto ends = [&](std::string_view extension) {
+    if (path.size() < extension.size()) return false;
+    for (std::size_t index = 0; index < extension.size(); ++index) {
+      char letter = path[path.size() - extension.size() + index];
+      if (letter >= 'A' && letter <= 'Z') letter = static_cast<char>(letter - 'A' + 'a');
+      if (letter != extension[index]) return false;
+    }
+    return true;
+  };
+  return ends(".jpg") || ends(".jpeg");
+}
+
+// A full-size screenshot becomes the 600x338 thumb the page can decode. An already sized file is unchanged.
+std::string ScreenshotThumb(std::string url) {
+  if (!ValidUrl(url)) return {};
+  const auto query_at = url.find('?');
+  const std::string path = query_at == std::string::npos ? url : url.substr(0, query_at);
+  const std::string query = query_at == std::string::npos ? std::string() : url.substr(query_at);
+  if (!JpegPath(path) || HasSizeToken(path)) return url;
+  const auto dot = path.rfind('.');
+  if (dot == std::string::npos) return url;
+  const std::string sized = path.substr(0, dot) + ".600x338" + path.substr(dot) + query;
+  return ValidUrl(sized) ? sized : std::string();
 }
 
 std::string TrimmedDescription(std::string text) {
@@ -80,6 +129,18 @@ std::string ResolveAsset(std::string_view format, std::string_view filename) {
   if (path.rfind("https://", 0) == 0) return ValidUrl(path) ? path : std::string();
   path.insert(0, kAssetBase);
   return ValidUrl(path) ? path : std::string();
+}
+
+// A microtrailer is a video file. Steam serves it from the trailer host, not the image CDN.
+std::string ResolveTrailer(std::string_view format, std::string_view filename) {
+  const bool mp4 = filename.size() >= 4 && filename.substr(filename.size() - 4) == ".mp4";
+  if (!mp4) return ResolveAsset(format, filename);
+  if (filename.find('\0') != std::string_view::npos || filename.find("..") != std::string_view::npos) return {};
+  std::string query;
+  const auto query_at = format.find('?');
+  if (query_at != std::string_view::npos) query = std::string(format.substr(query_at));
+  const std::string url = "https://video.akamai.steamstatic.com/store_trailers/" + std::string(filename) + query;
+  return ValidUrl(url) ? url : std::string();
 }
 
 const json::Value* ObjectField(const json::Value& value, std::string_view key) {
@@ -162,7 +223,7 @@ struct BrowseFile {
 bool BrowseMagic(const Bytes& bytes, unsigned* version) {
   if (bytes.size() < kBrowseMagic.size()) return false;
   if (!std::equal(kBrowseMagic.begin(), kBrowseMagic.end() - 1, bytes.begin())) return false;
-  if (bytes[7] != 1 && bytes[7] != 2 && bytes[7] != 3) return false;
+  if (bytes[7] < 1 || bytes[7] > 4) return false;
   *version = bytes[7];
   return true;
 }
@@ -229,6 +290,23 @@ BrowseFile LoadBrowse(const Storage& storage) {
         item.genres.push_back(std::move(name));
       }
     }
+    if (version >= 4) {
+      item.media_known = reader.Number(1) != 0;
+      item.developer = reader.String(kMaximumDeveloperBytes);
+      item.release_date = reader.String(kMaximumReleaseBytes);
+      if (!reader.okay || !ValidIdentity(item.developer, kMaximumDeveloperBytes) ||
+          !ValidIdentity(item.release_date, kMaximumReleaseBytes))
+        return {};
+    }
+    // A full-size screenshot is fetched again, once, as a thumb. A game with no screenshots stays cached.
+    const bool unsized = std::any_of(item.screenshots.begin(), item.screenshots.end(),
+                                     [](const std::string& url) { return !HasSizeToken(url); });
+    if (unsized) {
+      item.fetched_at = 0;
+      item.media_known = false;
+    } else if (version < 4 && item.fetched_at != 0) {
+      item.media_known = true;
+    }
     file.apps.emplace(item.app, std::move(item));
   }
   if (!reader.okay || reader.offset != body) return {};
@@ -248,7 +326,10 @@ bool SaveBrowse(const Storage& storage, const BrowseFile& file) {
   AppendNumber(out, file.apps.size(), 4);
   for (const auto& [id, item] : file.apps) {
     if (id != item.app || item.tags.size() > kMaximumTags || item.screenshots.size() > kMaximumShots) return false;
-    const std::size_t entry = 4 + 8 + 1 + 1 + 1 + item.trailer_thumbnail.size() + item.trailer_url.size() + 4;
+    if (!ValidIdentity(item.developer, kMaximumDeveloperBytes) || !ValidIdentity(item.release_date, kMaximumReleaseBytes))
+      return false;
+    const std::size_t entry = 4 + 8 + 1 + 1 + 1 + item.trailer_thumbnail.size() + item.trailer_url.size() + 4 +
+                              item.developer.size() + item.release_date.size();
     if (out.size() + entry + 4 > kMaxBrowseBytes) return false;
     AppendNumber(out, item.app, 4);
     AppendNumber(out, item.fetched_at, 8);
@@ -280,6 +361,9 @@ bool SaveBrowse(const Storage& storage, const BrowseFile& file) {
       if (!ValidGenre(genre)) return false;
       AppendString(out, genre);
     }
+    AppendNumber(out, item.media_known ? 1u : 0u, 1);
+    AppendString(out, item.developer);
+    AppendString(out, item.release_date);
   }
   if (out.size() + 4 > kMaxBrowseBytes) return false;
   AppendNumber(out, Checksum(out, out.size()), 4);
@@ -363,7 +447,7 @@ std::optional<std::vector<StoreBrowseItem>> ParseStoreBrowseItems(std::string_vi
           if (parsed_item.screenshots.size() >= kMaximumShots) break;
           const auto* filename = frame.Find("filename");
           if (!filename || !filename->is_string()) continue;
-          auto url = ResolveAsset({}, filename->text());
+          auto url = ScreenshotThumb(ResolveAsset({}, filename->text()));
           if (!url.empty()) parsed_item.screenshots.push_back(std::move(url));
         }
       }
@@ -380,7 +464,7 @@ std::optional<std::vector<StoreBrowseItem>> ParseStoreBrowseItems(std::string_vi
       const std::string_view pattern = format && format->is_string() ? std::string_view(format->text()) : std::string_view();
       if (const auto* thumb = trailer->Find("screenshot_medium"); thumb && thumb->is_string())
         parsed_item.trailer_thumbnail = ResolveAsset(pattern, thumb->text());
-      parsed_item.trailer_url = ResolveAsset(pattern, TrailerFile(*trailer));
+      parsed_item.trailer_url = ResolveTrailer(pattern, TrailerFile(*trailer));
     }
     if (const auto* basic = ObjectField(item, "basic_info")) {
       parsed_item.description_known = true;
@@ -478,15 +562,26 @@ std::optional<StoreBrowseItem> StoreBrowseService::Cached(GameId id) {
 }
 
 void StoreBrowseService::RememberDetails(GameId id, std::string description, std::vector<std::string> genres,
-                                         std::string controller) {
+                                         std::string controller, std::vector<std::string> screenshots,
+                                         std::string trailer_thumbnail, std::string trailer_url,
+                                         std::string developer, std::string release_date, bool include_media) {
   if (!id.steam_app()) return;
   description = TrimmedDescription(std::move(description));
   if (!ValidController(controller)) controller.clear();
+  if (!ValidIdentity(developer, kMaximumDeveloperBytes)) developer.clear();
+  if (!ValidIdentity(release_date, kMaximumReleaseBytes)) release_date.clear();
   std::vector<std::string> kept;
   for (auto& genre : genres) {
     if (kept.size() >= kMaximumGenres || !ValidGenre(genre)) continue;
     kept.push_back(std::move(genre));
   }
+  std::vector<std::string> shots;
+  for (auto& url : screenshots) {
+    if (shots.size() >= kMaximumShots || !ValidUrl(url)) continue;
+    shots.push_back(std::move(url));
+  }
+  if (!trailer_thumbnail.empty() && !ValidUrl(trailer_thumbnail)) trailer_thumbnail.clear();
+  if (!trailer_url.empty() && !ValidUrl(trailer_url)) trailer_url.clear();
   EnsureLoaded();
   std::unique_lock<std::mutex> lock(mutex_);
   if (stopping_) return;
@@ -501,6 +596,14 @@ void StoreBrowseService::RememberDetails(GameId id, std::string description, std
     item.description_known = true;
   }
   if (item.controller_support.empty() && !controller.empty()) item.controller_support = std::move(controller);
+  if (include_media) {
+    if (item.screenshots.empty()) item.screenshots = std::move(shots);
+    if (item.trailer_thumbnail.empty()) item.trailer_thumbnail = std::move(trailer_thumbnail);
+    if (item.trailer_url.empty()) item.trailer_url = std::move(trailer_url);
+    item.media_known = true;
+  }
+  if (item.developer.empty()) item.developer = std::move(developer);
+  if (item.release_date.empty()) item.release_date = std::move(release_date);
   SaveLocked(lock);
 }
 
@@ -535,9 +638,60 @@ void StoreBrowseService::Enqueue(GameId id, bool first) {
   wake_.notify_one();
 }
 
+void StoreBrowseService::FillWalkLocked(std::uint64_t now) {
+  std::size_t added = 0;
+  while (added < kBatch && walk_at_ < walk_.size()) {
+    const GameId id = walk_[walk_at_++];
+    const auto app = id.steam_app();
+    if (!app) continue;
+    if (requested_.count(id)) continue;
+    const auto found = cached_.find(static_cast<std::uint32_t>(*app));
+    if (found != cached_.end() && Fresh(found->second, now)) {
+      requested_.insert(id);
+      results_.push_back(found->second);
+      ++added;
+      continue;
+    }
+    if (pending_.size() >= kMaxPending) {
+      --walk_at_;
+      return;
+    }
+    requested_.insert(id);
+    pending_.push_back(id);
+    ++added;
+  }
+  if (walk_at_ < walk_.size()) return;
+  for (const auto& id : walk_) {
+    if (!requested_.count(id)) {
+      walk_at_ = 0;
+      return;
+    }
+  }
+}
+
+void StoreBrowseService::SetWalk(std::vector<GameId> ids) {
+  std::lock_guard<std::mutex> lock(mutex_);
+  walk_ = std::move(ids);
+  walk_at_ = 0;
+  wake_.notify_one();
+}
+
+void StoreBrowseService::SetTagSave(
+    std::function<void(std::uint64_t, std::vector<std::pair<GameId, std::vector<std::string>>>)> save) {
+  std::lock_guard<std::mutex> lock(mutex_);
+  tag_save_ = std::move(save);
+}
+
+void StoreBrowseService::SetTagAccount(std::uint64_t account) { tag_account_.store(account); }
+
 void StoreBrowseService::Request(GameId id) { Enqueue(id, false); }
 
 void StoreBrowseService::RequestFirst(GameId id) { Enqueue(id, true); }
+
+bool StoreBrowseService::Full() {
+  std::lock_guard<std::mutex> lock(mutex_);
+  return pending_.size() >= kMaxPending;
+}
 
 std::vector<StoreBrowseItem> StoreBrowseService::Pump(std::size_t maximum) {
   std::lock_guard<std::mutex> lock(mutex_);
@@ -578,7 +732,8 @@ void StoreBrowseService::FetchItems(const std::vector<std::uint32_t>& batch,
     return;
   }
   const auto now = Now();
-  std::lock_guard<std::mutex> lock(mutex_);
+  std::vector<std::pair<GameId, std::vector<std::string>>> tag_saves;
+  std::unique_lock<std::mutex> lock(mutex_);
   if (stopping_) return;
   std::map<std::uint32_t, StoreBrowseItem> by_app;
   for (auto& item : *parsed) by_app.emplace(item.app, std::move(item));
@@ -590,6 +745,7 @@ void StoreBrowseService::FetchItems(const std::vector<std::uint32_t>& batch,
       incoming.tags_known = true;
     }
     incoming.fetched_at = now;
+    incoming.media_known = true;
     if (const auto old = cached_.find(app); old != cached_.end()) {
       if (!incoming.description_known) {
         incoming.description = old->second.description;
@@ -600,10 +756,17 @@ void StoreBrowseService::FetchItems(const std::vector<std::uint32_t>& batch,
         incoming.genres = old->second.genres;
         incoming.genres_known = old->second.genres_known;
       }
+      if (incoming.developer.empty()) incoming.developer = old->second.developer;
+      if (incoming.release_date.empty()) incoming.release_date = old->second.release_date;
     }
     if (incoming.tags_known) cached_[app] = incoming;
+    if (incoming.tags_known) tag_saves.emplace_back(GameId::Steam(app), incoming.tags);
     results_.push_back(std::move(incoming));
   }
+  const auto save = tag_save_;
+  const auto account = tag_account_.load();
+  lock.unlock();
+  if (save && account && !tag_saves.empty()) save(account, std::move(tag_saves));
 }
 
 void StoreBrowseService::Run() {
@@ -613,13 +776,14 @@ void StoreBrowseService::Run() {
     bool tags_fresh = false;
     {
       std::unique_lock<std::mutex> lock(mutex_);
-      wake_.wait(lock, [this] { return stopping_ || !pending_.empty(); });
+      wake_.wait(lock, [this] { return stopping_ || !pending_.empty() || walk_at_ < walk_.size(); });
       if (stopping_) return;
       lock.unlock();
       EnsureLoaded();
       lock.lock();
       if (stopping_) return;
       const auto now = Now();
+      FillWalkLocked(now);
       while (!pending_.empty() && batch.size() < kBatch) {
         const auto id = pending_.front();
         pending_.pop_front();
@@ -631,7 +795,14 @@ void StoreBrowseService::Run() {
       tag_names = tag_names_;
       tags_fresh = tag_names_at_ != 0 && now >= tag_names_at_ && now - tag_names_at_ < kStoreBrowseTtlSeconds;
     }
-    if (batch.empty()) continue;
+    if (batch.empty()) {
+      // Cache hits still have to wait, or a long walk of saved records runs without a pause.
+      if (pause_.count() > 0 && !stopping_) {
+        std::unique_lock<std::mutex> lock(mutex_);
+        if (walk_at_ < walk_.size()) wake_.wait_for(lock, pause_, [this] { return stopping_; });
+      }
+      continue;
+    }
     if (!tags_fresh && fetch_) {
       if (auto body = fetch_(StoreTagListUrl(), cancel_)) {
         auto parsed = ParseStoreTagList(*body);

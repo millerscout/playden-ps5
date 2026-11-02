@@ -16,8 +16,9 @@
 #include <map>
 #include <optional>
 #include <set>
-#include <tuple>
 #include <string>
+#include <string_view>
+#include <tuple>
 #include <vector>
 
 namespace playden::homebrew {
@@ -559,7 +560,10 @@ struct Game {
     bool store_tags_known = false;
     std::vector<std::string> store_screenshots;
     std::string store_trailer_thumbnail;
+    std::string store_trailer_url;
     bool store_media_known = false;
+    std::string store_developer;
+    std::string store_release_date;
     std::string controller_support;
     std::optional<std::uint64_t> download_bytes;
     std::optional<std::uint64_t> install_bytes;
@@ -688,6 +692,8 @@ struct Navigation {
     // which tab is focused there: 0 Home, 1 Library, 2 Downloads, 3 Saves, 4 Settings.
     bool tabs_focused = false;
     int tab_focus = 0;
+    // The details stage is playing the game's trailer. Cross on that still toggles it.
+    bool detail_trailer_playing = false;
     // Saves tab: the filter (0 All, 1 Needs you, 2 In sync, 3 This console only, 4 Not installed)
     // and the game its details page shows.
     int saves_filter = 0;
@@ -885,6 +891,48 @@ struct ViewData {
 // Characters a Details description page holds: live pages have status lines above it.
 inline std::size_t DetailsDescriptionPage(bool simulation_mode) { return simulation_mode ? 300 : 200; }
 
+// The end of one description page. Stops on a space when the page would otherwise cut a word,
+// and never in the middle of a UTF-8 sequence. The space itself is left for the next page.
+inline std::size_t DescriptionPageEnd(std::string_view text, std::size_t offset, std::size_t page_size) {
+    if (offset >= text.size() || page_size == 0) return text.size();
+    std::size_t end = offset + page_size;
+    if (end > text.size()) end = text.size();
+    while (end > offset && end < text.size() &&
+           (static_cast<unsigned char>(text[end]) & 0xC0U) == 0x80U)
+        --end;
+    if (end >= text.size()) return text.size();
+    std::size_t word = end;
+    while (word > offset && text[word] != ' ' && text[word] != '\n') --word;
+    return word > offset ? word : end;
+}
+
+inline std::size_t DescriptionPageStart(std::string_view text, std::size_t end) {
+    while (end < text.size() && (text[end] == ' ' || text[end] == '\n')) ++end;
+    return end;
+}
+
+inline int DescriptionPageCount(std::string_view text, std::size_t page_size) {
+    int pages = 0;
+    std::size_t offset = 0;
+    while (offset < text.size() && pages < 1000) {
+        const std::size_t end = DescriptionPageEnd(text, offset, page_size);
+        if (end <= offset) break;
+        ++pages;
+        offset = DescriptionPageStart(text, end);
+    }
+    return pages > 0 ? pages : 1;
+}
+
+inline std::size_t DescriptionPageOffset(std::string_view text, int page, std::size_t page_size) {
+    std::size_t offset = 0;
+    for (int index = 0; index < page && offset < text.size(); ++index) {
+        const std::size_t end = DescriptionPageEnd(text, offset, page_size);
+        if (end <= offset) return offset;
+        offset = DescriptionPageStart(text, end);
+    }
+    return offset;
+}
+
 // Player words for a preparation journal step ("copy-template" → "Copying the Windows environment").
 std::string PreparationStepWords(const std::string& step);
 // Where a preparation stands, for the player: "Step 3 of 6 · Copying the Windows environment".
@@ -1039,9 +1087,12 @@ public:
                           std::vector<std::string> languages = {}, std::uint32_t dlc_count = 0,
                           std::vector<GameVersion> versions = {}, GameUpdate update = {}, bool updates_known = true);
     // Live mode: the Steam store's description, genres and controller support for one game;
-    // kept across library refreshes.
+    // kept across library refreshes. include_media writes the screenshot and trailer URLs, even when empty.
     void UpdateStoreDetails(GameId id, std::string description, std::vector<std::string> genres,
-                            std::vector<std::string> tags, std::string controller_support);
+                            std::vector<std::string> tags, std::string controller_support,
+                            std::vector<std::string> screenshots = {}, std::string trailer_thumbnail = {},
+                            std::string trailer_url = {}, std::string developer = {}, std::string release_date = {},
+                            bool include_media = false);
     // Live mode: user-defined store tags for one game (store page enrichment or Details).
     bool UpdateStoreTags(GameId id, std::vector<std::string> tags);
     // Live mode: tags, screenshot URLs and the trailer thumbnail for several games, applied together.
@@ -1051,7 +1102,10 @@ public:
         std::vector<std::string> tags;
         std::vector<std::string> screenshots;
         std::string trailer_thumbnail;
+        std::string trailer_url;
         bool include_media = false;
+        std::string developer;
+        std::string release_date;
         bool description_known = false;
         std::string description;
         std::string controller_support;
@@ -1135,9 +1189,12 @@ public:
     void export_recipe(GameId id);
 
     [[nodiscard]] const State& state() const noexcept { return state_; }
+    void StopTrailer() noexcept { state_.navigation.detail_trailer_playing = false; }
     [[nodiscard]] const ViewData& view() const noexcept { return view_; }
     [[nodiscard]] const ViewData& route_view() const noexcept { return route_view_; }
     [[nodiscard]] std::vector<const Game*> visible_games() const;
+    // The index visible_games() last built, or empty when that index is stale. Does not sort.
+    [[nodiscard]] std::vector<const Game*> cached_visible_games() const;
     [[nodiscard]] std::string snapshot() const;
     [[nodiscard]] const std::string& last_error() const noexcept { return last_error_; }
 
@@ -1281,7 +1338,10 @@ private:
         std::string controller_support;
         std::vector<std::string> screenshots;
         std::string trailer_thumbnail;
+        std::string trailer_url;
         bool media_known = false;
+        std::string developer;
+        std::string release_date;
     };
     std::map<GameId, StoreFacts> store_facts_;  // live: from the Steam store, applied over library refreshes
     std::vector<GameId> ready_prompts_;  // games to announce as ready to play, oldest first
@@ -1622,6 +1682,26 @@ private:
     [[nodiscard]] UpdateCheck update_check(GameId id) const;
     // The game's update is putting its files in place: Play waits.
     [[nodiscard]] bool update_locked(GameId id) const;
+
+    [[nodiscard]] bool library_index_current() const;
+    // visible_games() rebuilds this only when the catalog or the filters change.
+    mutable std::vector<const Game*> library_index_;
+    mutable const Game* library_index_data_ = nullptr;
+    mutable std::size_t library_index_size_ = 0;
+    mutable std::string library_index_query_;
+    mutable std::string library_index_scope_;
+    mutable std::string library_index_sort_;
+    mutable std::set<std::string> library_index_filters_;
+    mutable std::set<std::string> library_index_tags_;
+    mutable std::set<GameId> library_index_hidden_;
+    mutable std::set<GameId> library_index_favorites_;
+    mutable std::size_t library_index_members_ = 0;
+    mutable std::size_t library_index_installs_ = 0;
+    mutable int library_index_auth_ = -1;
+    mutable bool library_index_cache_ = false;
+    mutable bool library_index_valid_ = false;
+    std::uint64_t library_filter_epoch_ = 0;
+    mutable std::uint64_t library_index_epoch_ = 0;
 };
 
 } // namespace playden::homebrew

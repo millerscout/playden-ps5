@@ -671,6 +671,9 @@ int main(int argc, char** argv) {
         });
         details_sessions = std::make_unique<playden::LocalSessionRepository>(options->data_directory.string(), playden::LocalSessionRepository::DiagnosticReport{}, session_vault.get());
         app_details = std::make_unique<playden::steam::AppDetailsService>(*details_source, *details_sessions);
+        app_details->SetLog([log_directory](const std::string& line) {
+            playden::app::AppendLogLine(log_directory, "install.log", line);
+        });
         install_cm = std::make_unique<playden::steam::CmClient>(PLAYDEN_HOMEBREW_CA_BUNDLE, *library_storage);
         install_cm->SetOwner("install");
         install_cm->SetSharedSession(steam_cm);
@@ -826,7 +829,14 @@ int main(int argc, char** argv) {
 
     if (!options->simulation) {
         const std::string art_cache_dir = (options->data_directory / "art").string();
+        const std::string log_directory = (options->data_directory / "logs").string();
         artwork_backend = std::make_unique<playden::homebrew::HttpArtworkBackend>(PLAYDEN_HOMEBREW_CA_BUNDLE, art_cache_dir);
+        auto media_log = [log_directory](const std::string& line) {
+            std::fprintf(stderr, "artwork %s\n", line.c_str());
+            playden::app::AppendLogLine(log_directory, "artwork.log", line);
+        };
+        artwork_backend->SetLog(media_log);
+        if (services) services->SetStoreMediaLog(media_log);
         program_icons = std::make_unique<playden::homebrew::ProgramIconArtworkBackend>(*artwork_backend);
         artwork = std::make_unique<playden::homebrew::ArtworkService>(*program_icons);
     }

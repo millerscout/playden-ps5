@@ -25,6 +25,12 @@ struct StoreDetails {
   std::vector<std::string> genres;
   std::vector<std::string> tags;  // user-defined store tags when appdetails includes them
   std::string controller_support;
+  // Screenshot thumbs and the highlight trailer's poster and 480p file. Empty when the store lists none.
+  std::vector<std::string> screenshots;
+  std::string trailer_thumbnail;
+  std::string trailer_url;
+  std::string developer;
+  std::string release_date;
 };
 
 // The store's appdetails URL for one game, in English.

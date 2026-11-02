@@ -44,6 +44,10 @@ constexpr std::size_t kMaxFamilyLicenseLines = 300;
 // At most this many package IDs on one family PICS line.
 constexpr std::size_t kMaxFamilyIds = 100;
 
+std::int64_t ElapsedMs(Clock::time_point from) {
+  return std::chrono::duration_cast<std::chrono::milliseconds>(Clock::now() - from).count();
+}
+
 std::string Hex(const unsigned char* data, std::size_t size) {
   static constexpr char kDigits[] = "0123456789abcdef";
   std::string text;
@@ -1095,6 +1099,7 @@ AppInfoBuffers CmClient::FetchAppInfo(const StoredSession& stored, const std::ve
                                      const std::atomic<bool>& cancel, bool by_hash) {
   AppInfoBuffers result;
   if (app_ids.empty() || app_ids.size() > kMaxAppInfoBatch) return result;  // kProtocol
+  const auto started = Clock::now();
   const auto deadline = Clock::now() + std::chrono::milliseconds(hooks_.deadline_ms);
   Lease lease;
   bool reused = false;
@@ -1104,12 +1109,15 @@ AppInfoBuffers CmClient::FetchAppInfo(const StoredSession& stored, const std::ve
     if (error != CmError::kNone) result.buffers.clear();
     return result;
   };
+  const auto session_started = Clock::now();
   if (const auto open = Acquire(stored, cancel, deadline, &lease); open != CmError::kNone)
     return finish(open);
+  const auto session_ms = ElapsedMs(session_started);
   reused = lease.reused;
   auto& session = lease.session;
 
   std::vector<std::uint8_t> reply;
+  const auto token_started = Clock::now();
   if (const auto call = session->Call(cm::kEMsgClientPICSAccessTokenRequest, {},
                                       cm::EncodePicsAccessTokenRequest(app_ids),
                                       cm::kEMsgClientPICSAccessTokenResponse, &reply);
@@ -1121,6 +1129,7 @@ AppInfoBuffers CmClient::FetchAppInfo(const StoredSession& stored, const std::ve
     }
     return finish(call == CmError::kRejected ? CmError::kProtocol : call);
   }
+  const auto token_ms = ElapsedMs(token_started);
   std::vector<cm::AppRequest> tokens;
   std::vector<std::uint32_t> denied;
   if (!cm::DecodePicsAccessTokenResponse(reply, &tokens, &denied)) return finish(CmError::kProtocol);
@@ -1132,9 +1141,11 @@ AppInfoBuffers CmClient::FetchAppInfo(const StoredSession& stored, const std::ve
     requests.push_back(request);
   }
   std::vector<cm::PicsResponse> parts;
+  const auto pics_started = Clock::now();
   if (const auto pics = session->PicsBody(cm::EncodePicsAppsRequest(requests), &parts);
       pics != CmError::kNone)
     return finish(pics);
+  const auto pics_ms = ElapsedMs(pics_started);
   const std::set<std::uint32_t> wanted(app_ids.begin(), app_ids.end());
   std::map<std::uint32_t, std::string> why;
   std::map<std::uint32_t, const cm::PicsApp*> offloaded;
@@ -1164,6 +1175,7 @@ AppInfoBuffers CmClient::FetchAppInfo(const StoredSession& stored, const std::ve
   for (const auto& [id, app] : offloaded) result.hashed[id] = HashedAppInfo{app->sha, app->size};
   result.http_host = http_host;
   AppInfoHttpStats http;
+  std::int64_t http_wall_ms = 0;
   if (by_hash && !result.hashed.empty()) {
     const auto make_perform = [this]() -> AppInfoPerform {
       if (hooks_.app_info) return hooks_.app_info;
@@ -1171,10 +1183,12 @@ AppInfoBuffers CmClient::FetchAppInfo(const StoredSession& stored, const std::ve
       auto client = std::make_shared<HttpClient>(ca_bundle_);
       return [client](const HttpRequest& request, const std::atomic<bool>& stop) { return client->Perform(request, stop); };
     };
+    const auto http_started = Clock::now();
     for (auto& [id, text] : FetchAppInfoByHash(make_perform, http_host, result.hashed, kAppInfoHttpWorkers, cancel, &http)) {
       result.hashed.erase(id);
       result.buffers[id] = std::move(text);
     }
+    http_wall_ms = ElapsedMs(http_started);
   }
 
   for (const auto id : app_ids) {
@@ -1183,24 +1197,26 @@ AppInfoBuffers CmClient::FetchAppInfo(const StoredSession& stored, const std::ve
     if (std::find(denied.begin(), denied.end(), id) != denied.end()) reason = "token_denied";
     result.unanswered[id] = std::move(reason);
   }
-  if (!offloaded.empty() || !result.unanswered.empty()) {
-    // One line per batch Steam didn't answer in full, so the log tells a refused token from an HTTP-only answer.
-    std::map<std::string, std::size_t> counts;
-    for (const auto& [id, reason] : result.unanswered) ++counts[reason];
-    std::string line = "step=app_info requested=" + std::to_string(app_ids.size()) +
-                       " answered=" + std::to_string(result.buffers.size()) + " parts=" + std::to_string(parts.size()) +
-                       " tokens=" + std::to_string(tokens.size()) + " denied=" + std::to_string(denied.size()) +
-                       " offloaded=" + std::to_string(offloaded.size());
-    if (by_hash)
-      line += " http_fetched=" + std::to_string(http.fetched) + " http_failed=" + std::to_string(http.failed) +
-              " http_skipped=" + std::to_string(http.skipped) + " http_connections=" + std::to_string(http.new_connections) +
-              " http_ms=" + std::to_string(http.total_ms);
-    if (!http.error.empty()) line += " http_error=" + http.error;
-    for (const auto& [reason, count] : counts) line += " " + reason + "=" + std::to_string(count);
-    if (http_min_size) line += " http_min_size=" + std::to_string(http_min_size);
-    if (!http_host.empty()) line += " http_host=" + http_host.substr(0, 64);
-    Log(line);
-  }
+  // One line per batch, including one Steam answered in full. The phase times say whether the page waited
+  // on the shared connection, the token, product info, or the appinfo download.
+  std::map<std::string, std::size_t> counts;
+  for (const auto& [id, reason] : result.unanswered) ++counts[reason];
+  std::string line = "step=app_info requested=" + std::to_string(app_ids.size()) +
+                     " answered=" + std::to_string(result.buffers.size()) + " parts=" + std::to_string(parts.size()) +
+                     " tokens=" + std::to_string(tokens.size()) + " denied=" + std::to_string(denied.size()) +
+                     " offloaded=" + std::to_string(offloaded.size());
+  if (by_hash)
+    line += " http_fetched=" + std::to_string(http.fetched) + " http_failed=" + std::to_string(http.failed) +
+            " http_skipped=" + std::to_string(http.skipped) + " http_connections=" + std::to_string(http.new_connections) +
+            " http_ms=" + std::to_string(http.total_ms);
+  if (!http.error.empty()) line += " http_error=" + http.error;
+  for (const auto& [reason, count] : counts) line += " " + reason + "=" + std::to_string(count);
+  if (http_min_size) line += " http_min_size=" + std::to_string(http_min_size);
+  if (!http_host.empty()) line += " http_host=" + http_host.substr(0, 64);
+  line += " session_ms=" + std::to_string(session_ms) + " token_ms=" + std::to_string(token_ms) +
+          " pics_ms=" + std::to_string(pics_ms) + " http_wall_ms=" + std::to_string(http_wall_ms) +
+          " total_ms=" + std::to_string(ElapsedMs(started));
+  Log(line);
   return result;
 }
 
@@ -1425,6 +1441,7 @@ bool RestoreLicensedDepots(const Storage& storage, LicensedDepots& depots) {
 AcquisitionResult CmClient::FetchAcquisitionDates(const StoredSession& stored,
                                                   const std::atomic<bool>& cancel) {
   AcquisitionResult result;
+  const auto started = Clock::now();
   const auto now = hooks_.unix_now
                        ? hooks_.unix_now()
                        : static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::seconds>(
@@ -1434,7 +1451,7 @@ AcquisitionResult CmClient::FetchAcquisitionDates(const StoredSession& stored,
     const auto live_changes = shared_ ? CmLicenseChanges(*shared_) : 0;
     if (LicenseCacheFresh(loaded, stored.steam_id, now, live_changes)) {
       FillFromPackageCache(loaded, &result, now);
-      Log("step=packages ttl=hit licensed=" + std::to_string(loaded.packages.size()));
+      Log("step=packages ttl=hit licensed=" + std::to_string(loaded.packages.size()) + " ms=" + std::to_string(ElapsedMs(started)));
       return result;
     }
   }
@@ -1620,6 +1637,9 @@ AcquisitionResult CmClient::FetchAcquisitionDates(const StoredSession& stored,
   result.fetched_at = now;
   // Release notes the license list first, so the saved count includes a list that arrived during this read.
   Release(&lease, CmError::kNone);
+  // The connection is free again: this is the time a details fetch would have spent in session_ms.
+  Log("step=packages done licensed=" + std::to_string(packages.size()) + " fetched=" + std::to_string(to_fetch.size()) +
+      " ms=" + std::to_string(ElapsedMs(started)));
   if (package_cache_ && changes_ok && changes.current_change_number != 0) {
     for (auto& entry : remembered) {
       entry.second.borrowed = borrowed_packages.count(entry.first) > 0;

@@ -10,6 +10,49 @@ namespace {
 
 constexpr std::size_t kMaximumTags = 32;
 constexpr std::size_t kMaximumTagBytes = 64;
+constexpr std::size_t kMaximumShots = 4;
+constexpr std::size_t kMaximumUrlBytes = 512;
+constexpr std::size_t kMaximumDeveloperBytes = 128;
+constexpr std::size_t kMaximumReleaseBytes = 64;
+
+bool ValidUrl(std::string_view url) {
+  return url.size() <= kMaximumUrlBytes && url.rfind("https://", 0) == 0 && url.find('\0') == std::string_view::npos;
+}
+
+bool HasSizeToken(std::string_view url) {
+  const auto query = url.find('?');
+  const auto path = url.substr(0, query);
+  for (std::size_t start = 0; start < path.size(); ++start) {
+    if (path[start] < '0' || path[start] > '9') continue;
+    std::size_t width = start;
+    while (width < path.size() && path[width] >= '0' && path[width] <= '9') ++width;
+    if (width == start || width >= path.size() || path[width] != 'x') continue;
+    std::size_t height = width + 1;
+    if (height >= path.size() || path[height] < '0' || path[height] > '9') continue;
+    while (height < path.size() && path[height] >= '0' && path[height] <= '9') ++height;
+    if (height > width + 1) return true;
+  }
+  return false;
+}
+
+bool JpegUrl(std::string_view url) {
+  const auto query = url.find('?');
+  const auto path = url.substr(0, query);
+  auto ends = [&](std::string_view extension) {
+    if (path.size() < extension.size()) return false;
+    for (std::size_t index = 0; index < extension.size(); ++index) {
+      char letter = path[path.size() - extension.size() + index];
+      if (letter >= 'A' && letter <= 'Z') letter = static_cast<char>(letter - 'A' + 'a');
+      if (letter != extension[index]) return false;
+    }
+    return true;
+  };
+  return ends(".jpg") || ends(".jpeg");
+}
+
+std::string KeepUrl(std::string url) {
+  return ValidUrl(url) ? std::move(url) : std::string();
+}
 
 bool ValidTag(std::string_view tag) {
   return !tag.empty() && tag.size() <= kMaximumTagBytes && tag.find('\0') == std::string_view::npos;
@@ -44,6 +87,12 @@ std::string PlainText(std::string_view html) {
   }
   while (!collapsed.empty() && collapsed.back() == ' ') collapsed.pop_back();
   return collapsed;
+}
+
+std::string ShortIdentity(std::string text, std::size_t maximum) {
+  text = PlainText(text);
+  if (text.find('\0') != std::string::npos || text.size() > maximum) return {};
+  return text;
 }
 
 void AppendTag(std::vector<std::string>& tags, std::string value) {
@@ -96,6 +145,47 @@ std::optional<StoreDetails> ParseStoreDetails(std::uint32_t id, std::string_view
     details.controller_support = support->text();
   ParseTagsField(data->Find("tags"), details.tags);
   ParseTagsField(data->Find("tag"), details.tags);
+  if (const auto* shots = data->Find("screenshots"); shots && shots->is_array()) {
+    for (const auto& shot : shots->array()) {
+      if (details.screenshots.size() >= kMaximumShots) break;
+      std::string url;
+      if (const auto* thumb = shot.Find("path_thumbnail"); thumb && thumb->is_string()) url = KeepUrl(thumb->text());
+      if (url.empty()) {
+        if (const auto* full = shot.Find("path_full"); full && full->is_string() && JpegUrl(full->text()) && HasSizeToken(full->text()))
+          url = KeepUrl(full->text());
+      }
+      if (!url.empty()) details.screenshots.push_back(std::move(url));
+    }
+  }
+  const json::Value* movie = nullptr;
+  if (const auto* movies = data->Find("movies"); movies && movies->is_array()) {
+    for (const auto& entry : movies->array()) {
+      const auto* highlight = entry.Find("highlight");
+      if (highlight && highlight->is_bool() && highlight->boolean()) {
+        movie = &entry;
+        break;
+      }
+      if (!movie) movie = &entry;
+    }
+  }
+  if (movie) {
+    if (const auto* thumb = movie->Find("thumbnail"); thumb && thumb->is_string())
+      details.trailer_thumbnail = KeepUrl(thumb->text());
+    const auto* mp4 = movie->Find("mp4");
+    const auto* webm = movie->Find("webm");
+    const json::Value* file = nullptr;
+    if (mp4 && mp4->is_object()) file = mp4->Find("480");
+    if ((!file || !file->is_string()) && webm && webm->is_object()) file = webm->Find("480");
+    if (file && file->is_string()) details.trailer_url = KeepUrl(file->text());
+  }
+  if (const auto* developers = data->Find("developers"); developers && developers->is_array() && !developers->array().empty()) {
+    if (const auto& first = developers->array().front(); first.is_string())
+      details.developer = ShortIdentity(first.text(), kMaximumDeveloperBytes);
+  }
+  if (const auto* released = data->Find("release_date"); released && released->is_object()) {
+    if (const auto* date = released->Find("date"); date && date->is_string())
+      details.release_date = ShortIdentity(date->text(), kMaximumReleaseBytes);
+  }
   return details;
 }
 

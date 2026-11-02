@@ -21,6 +21,8 @@ namespace {
 
 using playden::GameSummary;
 using playden::homebrew::AuthState;
+using playden::homebrew::DescriptionPageEnd;
+using playden::homebrew::DescriptionPageStart;
 using playden::homebrew::CloudRequestKind;
 using playden::homebrew::CloudStatus;
 using playden::homebrew::LibraryUpdate;
@@ -2453,12 +2455,12 @@ void live_store_tag_filter_from_details() {
     check(model.UpdateStoreTags(SteamId(43), {"Adventure"}), "second game tagged");
     check(model.action("r1") && model.action("details:42"), "details open");
     check(has_row(model, "detail-tag-0"), "details lists store tags");
-    check(model.action("down") && model.state().navigation.focus_key == "detail-tag-0",
-          "Down from the actions focuses the first tag chip");
+    check(model.action("up") && model.state().navigation.focus_key == "detail-tag-0",
+          "Up from the actions focuses the first tag chip");
     check(model.action("right") && model.state().navigation.focus_key == "detail-tag-1",
           "Right moves to the next tag chip");
-    check(model.action("up") && model.state().navigation.focus_key == "details-favorite",
-          "Up from a tag chip returns to the action that opened them");
+    check(model.action("down") && model.state().navigation.focus_key == "details-favorite",
+          "Down from a tag chip returns to the action that opened them");
     activate(model, "detail-tag-0");
     check(model.state().library.tag_filters == std::set<std::string>{"Roguelike"} &&
               model.state().navigation.route == Route::Library,
@@ -2554,7 +2556,7 @@ void live_detail_genres_open_and_more_tags_list_the_rest() {
             if (row.key == key) return row.title;
         return std::string{};
     };
-    check(model.action("down") && model.state().navigation.focus_key == "detail-tag-0" &&
+    check(model.action("up") && model.state().navigation.focus_key == "detail-tag-0" &&
               title_of("detail-tag-0") == "Action",
           "Action is a tag chip");
     check(model.action("right") && title_of("detail-tag-1") == "Adventure", "Adventure is the next chip");
@@ -2589,6 +2591,64 @@ void live_store_details_fill_the_description() {
           "the store fills the description, genres and controller support");
     check(model.UpdateLibrary({{game(SteamId(42), "Synthetic")}, false, {}, false, false, {}}), "library refreshed");
     check(model.state().games[0].description == "A synthetic game.", "a library refresh keeps the store description");
+}
+
+void live_store_media_survives_a_library_refresh() {
+    auto model = make_live();
+    model.UpdateAccount({AuthState::SignedIn, "123", "Synthetic", {}, {}, true});
+    check(model.UpdateLibrary({{game(SteamId(42), "Synthetic")}, false, {}, false, false, {}}), "media: library loaded");
+    model.UpdateStoreDetails(SteamId(42), "A synthetic game.", {"Action"}, {}, "full",
+                             {"https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/42/ss.600x338.jpg"},
+                             "https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/42/trailer.jpg",
+                             "https://cdn.example/trailer.mp4", "Valve", "16 Nov, 2004", true);
+    const auto& stored = model.state().games[0];
+    check(stored.store_media_known && stored.store_screenshots.size() == 1 &&
+              stored.store_trailer_thumbnail.find("trailer.jpg") != std::string::npos &&
+              stored.store_trailer_url == "https://cdn.example/trailer.mp4" &&
+              stored.store_developer == "Valve" && stored.store_release_date == "16 Nov, 2004",
+          "the store page fills screenshots, the trailer and who made it");
+    check(model.UpdateLibrary({{game(SteamId(42), "Synthetic")}, false, {}, false, false, {}}), "media: library refreshed");
+    const auto& kept = model.state().games[0];
+    check(kept.store_media_known && kept.store_screenshots.size() == 1 &&
+              kept.store_trailer_url == "https://cdn.example/trailer.mp4" && kept.store_developer == "Valve",
+          "a library refresh keeps the store media");
+    check(model.action("details:42") && model.action("down") && model.state().navigation.focus_key == "details-media-0",
+          "Down from the actions enters the filmstrip");
+    check(model.action("up") && model.state().navigation.focus_key == "details-favorite",
+          "Up from the filmstrip returns to the action");
+    check(model.action("up") && model.state().navigation.focus_key == "detail-tag-0",
+          "Up from the actions enters the tags");
+    check(model.action("down") && model.action("down") && model.state().navigation.focus_key == "details-media-0" &&
+              model.action("cross") && !model.state().navigation.detail_trailer_playing,
+          "Cross does not play a trailer that is not on the Steam CDN");
+}
+
+void description_pages_break_on_words() {
+    const std::string text = "abcdefghij klmnopqrstuvwxyz";
+    check(DescriptionPageEnd(text, 0, 12) == 10, "a description page ends before the next word");
+    check(DescriptionPageStart(text, 10) == 11, "the next page starts on that word");
+    check(DescriptionPageEnd("Supercalifragilistic", 0, 8) == 8, "a word longer than the page is cut");
+}
+
+void trailer_cross_starts_and_stops() {
+    auto model = make_live();
+    model.UpdateAccount({AuthState::SignedIn, "123", "Synthetic", {}, {}, true});
+    check(model.UpdateLibrary({{game(SteamId(43), "Preview")}, false, {}, false, false, {}}), "trailer: library loaded");
+    model.UpdateStoreDetails(SteamId(43), "A short preview.", {"Action"}, {}, "",
+                             {"https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/43/ss.600x338.jpg"},
+                             "https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/43/movie.293x165.jpg",
+                             "https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/43/microtrailer.mp4",
+                             "", "", true);
+    check(model.action("details:43") && model.action("down") && model.state().navigation.focus_key == "details-media-0",
+          "the trailer still is the first filmstrip cell");
+    check(model.action("cross") && model.state().navigation.detail_trailer_playing, "Cross plays the trailer");
+    check(model.action("cross") && !model.state().navigation.detail_trailer_playing, "Cross stops the trailer");
+    check(model.action("cross") && model.state().navigation.detail_trailer_playing, "Cross plays it again");
+    check(model.action("right") && model.state().navigation.focus_key == "details-media-1" &&
+              !model.state().navigation.detail_trailer_playing,
+          "moving to a screenshot stops the trailer");
+    check(model.action("left") && model.action("cross") && model.state().navigation.detail_trailer_playing, "the trailer plays");
+    check(model.action("circle") && !model.state().navigation.detail_trailer_playing, "leaving the page stops the trailer");
 }
 
 } // namespace
@@ -4327,6 +4387,9 @@ int main() {
     live_play_does_the_next_useful_thing();
     live_queued_setup_names_the_game_ahead();
     live_store_details_fill_the_description();
+    live_store_media_survives_a_library_refresh();
+    description_pages_break_on_words();
+    trailer_cross_starts_and_stops();
     live_store_tag_filter_from_details();
     r3_opens_the_tag_sheet_from_a_poster();
     live_detail_genres_open_and_more_tags_list_the_rest();

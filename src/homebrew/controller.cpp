@@ -2191,18 +2191,30 @@ void Controller::TickInstalls() {
     completed.push_back({finished.id, finished.install_bytes, finished.volume_id, finished.finished_at, finished.update_bytes});
   model_.UpdateInstalls(jobs, installed, completed);
 }
+void Controller::LogStoreMedia(const GameId& id, const char* where,
+                               const std::vector<std::string>& shots, const std::string& thumb,
+                               const std::string& video) {
+  if (!store_media_log_) return;
+  store_media_log_("media " + std::string(where) + " app=" + ToKey(id) + " shots=" + std::to_string(shots.size()) +
+                   " trailer=" + (thumb.empty() ? "0" : "1") + " video=" + (video.empty() ? "0" : "1"));
+  if (!thumb.empty()) store_media_log_("media thumb app=" + ToKey(id) + " " + thumb);
+  if (!video.empty()) store_media_log_("media video app=" + ToKey(id) + " " + video);
+  for (const auto& url : shots) store_media_log_("media shot app=" + ToKey(id) + " " + url);
+}
+
 void Controller::TickStoreDetails() {
   if (!store_details_) return;
-  // The store is public: a game's description is asked for when its details open,
-  // unless the browse record already has both the description and the genres.
+  // The store is public: a game's page is asked for when its details open, unless the browse
+  // record already has the description, the genres and the screenshot answer.
   const auto& detail = model_.state().navigation.detail_id;
   if (detail && detail != requested_store_detail_) {
     requested_store_detail_ = detail;
     bool stored = false;
     if (store_browse_) {
       if (auto cached = store_browse_->Cached(*detail)) {
-        stored = cached->description_known && cached->genres_known;
-        if (cached->description_known || cached->genres_known || !cached->controller_support.empty()) {
+        stored = cached->description_known && cached->genres_known && cached->media_known;
+        if (cached->description_known || cached->genres_known || !cached->controller_support.empty() ||
+            cached->media_known || !cached->developer.empty() || !cached->release_date.empty()) {
           Simulation::StoreBrowseUpdate update;
           update.id = *detail;
           update.description_known = cached->description_known;
@@ -2210,17 +2222,36 @@ void Controller::TickStoreDetails() {
           update.controller_support = std::move(cached->controller_support);
           update.genres_known = cached->genres_known;
           update.genres = std::move(cached->genres);
+          if (cached->media_known) {
+            update.include_media = true;
+            update.screenshots = std::move(cached->screenshots);
+            update.trailer_thumbnail = std::move(cached->trailer_thumbnail);
+            update.trailer_url = std::move(cached->trailer_url);
+          }
+          update.developer = std::move(cached->developer);
+          update.release_date = std::move(cached->release_date);
+          if (cached->media_known)
+            LogStoreMedia(*detail, "cached", update.screenshots, update.trailer_thumbnail, update.trailer_url);
           model_.UpdateStoreBrowse({std::move(update)});
         }
       }
     }
-    if (!stored) store_details_->Request(*detail);
+    if (!stored) {
+      if (store_media_log_) store_media_log_("media ask app=" + ToKey(*detail));
+      store_details_->Request(*detail);
+    }
   }
   for (auto& details : store_details_->Pump()) {
     if (store_browse_)
-      store_browse_->RememberDetails(details.id, details.description, details.genres, details.controller_support);
+      store_browse_->RememberDetails(details.id, details.description, details.genres, details.controller_support,
+                                    details.screenshots, details.trailer_thumbnail, details.trailer_url,
+                                    details.developer, details.release_date, true);
+    LogStoreMedia(details.id, "appdetails", details.screenshots, details.trailer_thumbnail, details.trailer_url);
     model_.UpdateStoreDetails(details.id, std::move(details.description), std::move(details.genres),
-                              std::move(details.tags), std::move(details.controller_support));
+                              std::move(details.tags), std::move(details.controller_support),
+                              std::move(details.screenshots), std::move(details.trailer_thumbnail),
+                              std::move(details.trailer_url), std::move(details.developer),
+                              std::move(details.release_date), true);
   }
 }
 void Controller::TickStoreTags() {
@@ -2229,23 +2260,64 @@ void Controller::TickStoreTags() {
   if (account.authentication != AuthState::SignedIn && account.authentication != AuthState::Offline) return;
   if (account.id.empty()) return;
   steam_account_id_ = std::strtoull(account.id.c_str(), nullptr, 10);
-  const auto& navigation = model_.state().navigation;
-  if ((navigation.route == Route::Details || navigation.route == Route::Session) && navigation.detail_id &&
-      navigation.detail_id->steam_app()) {
-    const auto open = std::find_if(model_.state().games.begin(), model_.state().games.end(),
-                                   [&](const Game& game) { return game.id == *navigation.detail_id; });
-    const bool refresh = !store_browse_->Cached(*navigation.detail_id);
-    if (open == model_.state().games.end() || !open->store_tags_known || !open->store_media_known || refresh)
-      store_browse_->RequestFirst(*navigation.detail_id);
+  if (library_cache_ && !store_tags_hooked_) {
+    store_browse_->SetTagSave(
+        [cache = library_cache_](std::uint64_t saved_account,
+                                 std::vector<std::pair<GameId, std::vector<std::string>>> updates) {
+          if (saved_account) cache->MergeGameTags(saved_account, updates);
+        });
+    store_tags_hooked_ = true;
   }
-  for (const auto& game : model_.state().games) {
-    if (game.id.store != Store::kSteam || !game.id.steam_app()) continue;
-    if (game.store_tags_known && game.store_media_known && store_browse_->Cached(game.id)) continue;
-    store_browse_->Request(game.id);
+  store_browse_->SetTagAccount(steam_account_id_);
+  const auto needs = [](const Game& game) {
+    return game.id.store == Store::kSteam && game.id.steam_app() && !(game.store_tags_known && game.store_media_known);
+  };
+  const auto& state = model_.state();
+  const bool show_free = state.library.filters.contains("free");
+  if (store_walk_games_ != state.games.data() || store_walk_count_ != state.games.size() ||
+      store_walk_shows_free_ != show_free) {
+    std::vector<GameId> walk;
+    walk.reserve(state.games.size());
+    for (const auto& game : state.games) {
+      if (game.free && !show_free) continue;
+      if (!needs(game)) continue;
+      walk.push_back(game.id);
+    }
+    store_browse_->SetWalk(std::move(walk));
+    store_walk_games_ = state.games.data();
+    store_walk_count_ = state.games.size();
+    store_walk_shows_free_ = show_free;
+  }
+  const auto& navigation = state.navigation;
+  std::vector<GameId> priority;
+  if ((navigation.route == Route::Details || navigation.route == Route::Session) && navigation.detail_id) {
+    const auto open = std::find_if(state.games.begin(), state.games.end(),
+                                   [&](const Game& game) { return game.id == *navigation.detail_id; });
+    if (open != state.games.end() && needs(*open)) priority.push_back(open->id);
+  }
+  // The grid builds this index when it draws. A stale index waits for that draw.
+  const auto visible = model_.cached_visible_games();
+  if (navigation.route == Route::Library && !visible.empty()) {
+    const int last = static_cast<int>(visible.size()) - 1;
+    const int selected = std::clamp(navigation.selected_index, 0, last);
+    const int from = std::max(0, selected - 4);
+    const int to = std::min(last, selected + 4);
+    for (int index = from; index <= to; ++index)
+      if (needs(*visible[static_cast<std::size_t>(index)]))
+        priority.push_back(visible[static_cast<std::size_t>(index)]->id);
+  }
+  const auto now = std::chrono::steady_clock::now();
+  if (priority != store_priority_ids_) {
+    store_priority_ids_ = std::move(priority);
+    store_priority_at_ = now + std::chrono::milliseconds(500);
+    store_priority_sent_ = false;
+  } else if (!store_priority_sent_ && now >= store_priority_at_) {
+    for (auto id = store_priority_ids_.rbegin(); id != store_priority_ids_.rend(); ++id)
+      store_browse_->RequestFirst(*id);
+    store_priority_sent_ = true;
   }
   auto records = store_browse_->Pump();
   if (records.empty()) return;
-  std::vector<std::pair<GameId, std::vector<std::string>>> merges;
   std::vector<Simulation::StoreBrowseUpdate> updates;
   updates.reserve(records.size());
   for (auto& record : records) {
@@ -2255,17 +2327,17 @@ void Controller::TickStoreTags() {
     update.tags = std::move(record.tags);
     update.screenshots = std::move(record.screenshots);
     update.trailer_thumbnail = std::move(record.trailer_thumbnail);
-    update.include_media = true;
+    update.trailer_url = std::move(record.trailer_url);
+    update.include_media = record.media_known;
     update.description_known = record.description_known;
     update.description = std::move(record.description);
     update.controller_support = std::move(record.controller_support);
     update.genres_known = record.genres_known;
     update.genres = std::move(record.genres);
-    if (update.tags_known) merges.emplace_back(update.id, update.tags);
+    update.developer = std::move(record.developer);
+    update.release_date = std::move(record.release_date);
     updates.push_back(std::move(update));
   }
-  if (library_cache_ && steam_account_id_ != 0 && !merges.empty())
-    library_cache_->MergeGameTags(steam_account_id_, merges);
   model_.UpdateStoreBrowse(std::move(updates));
 }
 void Controller::TickAppDetails() {

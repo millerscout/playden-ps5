@@ -8,6 +8,7 @@
 #include <atomic>
 #include <climits>
 #include <cstddef>
+#include <cstdio>
 #include <cstdlib>
 #include <cstdint>
 #include <cerrno>
@@ -17,6 +18,7 @@
 #include <memory>
 #include <mutex>
 #include <string>
+#include <string_view>
 #include <utility>
 #include <vector>
 #include <sys/stat.h>
@@ -138,7 +140,78 @@ bool CheckedImageBytes(int width, int height, std::size_t& bytes) {
   return true;
 }
 
-// The game's own CDN art: its cover, its library hero and its logo, and nothing else.
+bool SteamStaticHost(std::string_view host) {
+  for (const char* name : {"cdn.cloudflare.steamstatic.com", "shared.cloudflare.steamstatic.com",
+                           "cdn.akamai.steamstatic.com", "shared.akamai.steamstatic.com",
+                           "steamcdn-a.akamaihd.net"})
+    if (host == name) return true;
+  return false;
+}
+
+// A store screenshot or trailer poster. Cover, hero, logo, and header stay on the exact-match path.
+bool StoreStillUrl(std::string_view source) {
+  constexpr std::string_view kHttps = "https://";
+  if (source.size() <= kHttps.size() || source.substr(0, kHttps.size()) != kHttps) return false;
+  if (source.find('\\') != std::string_view::npos || source.find('@') != std::string_view::npos ||
+      source.find('#') != std::string_view::npos)
+    return false;
+  const auto path_at = source.find('/', kHttps.size());
+  if (path_at == std::string_view::npos || path_at == kHttps.size()) return false;
+  const auto host = source.substr(kHttps.size(), path_at - kHttps.size());
+  if (host.find(':') != std::string_view::npos || !SteamStaticHost(host)) return false;
+
+  const auto rest = source.substr(path_at);
+  const auto query_at = rest.find('?');
+  const auto path = rest.substr(0, query_at);
+  if (query_at != std::string_view::npos) {
+    const auto query = rest.substr(query_at);
+    if (query.size() < 4 || query.substr(0, 3) != "?t=") return false;
+    for (std::size_t index = 3; index < query.size(); ++index)
+      if (query[index] < '0' || query[index] > '9') return false;
+  }
+  if (path.find("..") != std::string_view::npos || path.find("//") != std::string_view::npos) return false;
+
+  constexpr std::string_view kAssets = "/store_item_assets/";
+  constexpr std::string_view kApps = "/steam/apps/";
+  const bool assets = path.size() > kAssets.size() && path.substr(0, kAssets.size()) == kAssets;
+  const bool apps = path.size() > kApps.size() && path.substr(0, kApps.size()) == kApps;
+  if (!assets && !apps) return false;
+  if (apps) {
+    std::size_t index = kApps.size();
+    if (path[index] < '0' || path[index] > '9') return false;
+    while (index < path.size() && path[index] >= '0' && path[index] <= '9') ++index;
+    if (index >= path.size() || path[index] != '/') return false;
+  }
+
+  const auto slash = path.rfind('/');
+  const auto file = slash == std::string_view::npos ? path : path.substr(slash + 1);
+  if (file == "library_600x900.jpg" || file == "library_hero.jpg" || file == "logo.png" ||
+      file == "header.jpg")
+    return false;
+  auto extension = [&](std::string_view suffix) {
+    return file.size() > suffix.size() && file.substr(file.size() - suffix.size()) == suffix;
+  };
+  return extension(".jpg") || extension(".jpeg") || extension(".png");
+}
+
+std::string StillCacheName(const ArtworkKey& key) {
+  std::uint64_t hash = 14695981039346656037ull;
+  for (unsigned char byte : key.source) {
+    hash ^= byte;
+    hash *= 1099511628211ull;
+  }
+  char hex[17];
+  std::snprintf(hex, sizeof(hex), "%016llx", static_cast<unsigned long long>(hash));
+  const auto query = key.source.find('?');
+  const auto path = query == std::string::npos ? std::string_view(key.source)
+                                                : std::string_view(key.source).substr(0, query);
+  const char* extension = ".jpg";
+  if (path.size() >= 5 && path.substr(path.size() - 5) == ".jpeg") extension = ".jpeg";
+  else if (path.size() >= 4 && path.substr(path.size() - 4) == ".png") extension = ".png";
+  return ToKey(key.game_id) + "_" + hex + extension;
+}
+
+// The game's cover, hero, and logo, plus Steam CDN screenshots and trailer posters.
 bool CanonicalKey(const ArtworkKey& key) {
   if (key.account_generation == 0 || !key.game_id.valid() ||
       key.source.size() > kMaxArtworkSourceBytes) return false;
@@ -146,13 +219,14 @@ bool CanonicalKey(const ArtworkKey& key) {
                            ToKey(key.game_id) + "/";
   for (const char* name : {"library_600x900.jpg", "library_hero.jpg", "logo.png"})
     if (key.source == base + name) return true;
-  return false;
+  return StoreStillUrl(key.source);
 }
 
 std::string CacheFileName(const ArtworkKey& key) {
   if (key.account_generation == 0 || !key.game_id.valid() || key.source.empty()) return {};
   const std::string id = ToKey(key.game_id);
   if (id.empty()) return {};
+  if (StoreStillUrl(key.source)) return StillCacheName(key);
   if (key.source.find("library_600x900.jpg") != std::string::npos) return id + "_600x900.jpg";
   if (key.source.find("library_hero.jpg") != std::string::npos) return id + "_hero.jpg";
   if (key.source.find("logo.png") != std::string::npos) return id + "_logo.png";
@@ -343,8 +417,20 @@ HttpArtworkBackend::~HttpArtworkBackend() = default;
 
 std::optional<ArtworkImage> HttpArtworkBackend::Load(
     const ArtworkKey& key, const std::atomic<bool>& cancel) {
-  if (!CanonicalKey(key) || cancel.load(std::memory_order_acquire))
+  const bool still = StoreStillUrl(key.source);
+  const auto note = [&](const std::string& reason) {
+    if (!log_ || !still) return;
+    log_("still " + reason + " app=" + ToKey(key.game_id) + " url=" + key.source);
+  };
+  if (!CanonicalKey(key) || cancel.load(std::memory_order_acquire)) {
+    if (!CanonicalKey(key)) {
+      if (log_ && (still || key.source.find("store_item_assets") != std::string::npos))
+        log_("still rejected app=" + ToKey(key.game_id) + " url=" + key.source);
+    } else if (still) {
+      note("canceled");
+    }
     return std::nullopt;
+  }
 
   const bool cover = key.source.find("library_600x900.jpg") != std::string::npos;
   // A wide image in the cover slot is the header.jpg fallback: frame it as a portrait card.
@@ -362,8 +448,14 @@ std::optional<ArtworkImage> HttpArtworkBackend::Load(
     cached = cache_->Read(cache_dir_, file_name, &fresh);
   }
   if (cached && fresh)
-    if (auto image = DecodeArtwork(*cached)) return framed(std::move(image));
-  if (cancel.load(std::memory_order_acquire)) return std::nullopt;
+    if (auto image = DecodeArtwork(*cached)) {
+      note("cache " + std::to_string(image->width) + "x" + std::to_string(image->height));
+      return framed(std::move(image));
+    }
+  if (cancel.load(std::memory_order_acquire)) {
+    note("canceled");
+    return std::nullopt;
+  }
 
   steam::HttpRequest request;
   request.method = steam::HttpMethod::kGet;
@@ -385,12 +477,24 @@ std::optional<ArtworkImage> HttpArtworkBackend::Load(
         std::lock_guard<std::mutex> lock(cache_->mutex);
         cache_->Save(cache_dir_, file_name, response.body);
       }
+      note("ok " + std::to_string(image->width) + "x" + std::to_string(image->height) +
+           " bytes=" + std::to_string(response.body.size()));
       return framed(std::move(image));
     }
+    note("decode bytes=" + std::to_string(response.body.size()));
+  } else if (!response.ok()) {
+    note(std::string("error=") + steam::HttpErrorName(response.error) +
+         " bytes=" + std::to_string(response.body.size()));
+  } else {
+    note("http=" + std::to_string(response.status_code) + " bytes=" + std::to_string(response.body.size()));
   }
 
   // Offline, or the CDN failed: an expired cached copy is better than none.
-  if (cached && !fresh) return framed(DecodeArtwork(*cached));
+  if (cached && !fresh)
+    if (auto image = framed(DecodeArtwork(*cached))) {
+      note("stale " + std::to_string(image->width) + "x" + std::to_string(image->height));
+      return image;
+    }
   return std::nullopt;
 }
 

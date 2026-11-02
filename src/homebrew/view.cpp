@@ -12,6 +12,7 @@
 #include "homebrew/simulation.hpp"
 #include "homebrew/store_art.hpp"
 #include "homebrew/title_icon.hpp"
+#include "homebrew/trailer_player.hpp"
 #include <ctime>
 
 #include "gfx/draw_list.hpp"
@@ -450,6 +451,10 @@ class Render::Impl
         }
         if (hero_ != 0)
             glDeleteTextures(1, &hero_);
+        if (trailer_)
+            trailer_->Stop();
+        if (trailer_texture_ != 0)
+            glDeleteTextures(1, &trailer_texture_);
         if (capture_color_ != 0)
             glDeleteRenderbuffers(1, &capture_color_);
         if (capture_framebuffer_ != 0)
@@ -470,6 +475,12 @@ class Render::Impl
         stats_.native_width = width;
         stats_.native_height = height;
         const State &state = simulation.state();
+        if (trailer_ && (trailer_->failed() || state.navigation.route != Route::Details)) {
+            if (state.navigation.detail_trailer_playing)
+                simulation.StopTrailer();
+            if (trailer_->running() || trailer_->failed())
+                trailer_->Stop();
+        }
         if (live_artwork_) live_artwork_->BeginFrame(state.simulation_mode ? 0 : state.account_generation);
         update_qr_cache(state);
         focus_motion_.begin_frame(dt, state.reduced_motion);
@@ -3179,16 +3190,15 @@ class Render::Impl
     {
         const GameId id = state.navigation.detail_id.value_or(state.navigation.selected_game_id);
         const Game *game = game_by_id(state, id);
-        const gfx::Rect hero{0.0F, 0.0F, kWidth, 620.0F};
         const bool live_art = !state.simulation_mode && live_artwork_ && !state.account().id.empty() && id.valid();
         const std::uint32_t hero_texture = state.simulation_mode ? hero_ :
             live_art ? store_texture(id, HeroUrl(id)) : 0;
+        // The library hero is only the atmosphere. The page itself is the store's stills.
         if (hero_texture != 0)
-            scene_.image(hero_texture, hero, gfx::kFullUv, kText);
+            scene_.image(hero_texture, {0.0F, 0.0F, kWidth, kHeight}, gfx::kFullUv, kText.with_alpha(0.22F));
         else
-            scene_.gradient_rect(hero, 0.0F, id_color(id), kBackground);
-        scene_.gradient_rect({0.0F, 0.0F, kWidth, 186.0F}, 0.0F, kBackground.with_alpha(0.4F), kBackground.with_alpha(0.0F));
-        scene_.gradient_rect({0.0F, 465.0F, kWidth, 156.0F}, 0.0F, kBackground.with_alpha(0.0F), kBackground);
+            scene_.gradient_rect({0.0F, 0.0F, kWidth, kHeight}, 0.0F, id_color(id), kBackground);
+        scene_.rounded_rect({0.0F, 0.0F, kWidth, kHeight}, 0.0F, kBackground.with_alpha(0.78F));
 
         // Where Circle returns, over the hero.
         const Route origin = state.navigation.detail_origin;
@@ -3204,32 +3214,205 @@ class Render::Impl
             store_texture(id, LogoUrl(id), &logo_width, &logo_height) : 0;
         if (logo != 0 && logo_width > 0 && logo_height > 0)
         {
-            const float fit_scale = std::min(460.0F / static_cast<float>(logo_width),
-                                             160.0F / static_cast<float>(logo_height));
+            const float fit_scale = std::min(420.0F / static_cast<float>(logo_width),
+                                             88.0F / static_cast<float>(logo_height));
             const float w = static_cast<float>(logo_width) * fit_scale;
             const float h = static_cast<float>(logo_height) * fit_scale;
-            const gfx::Rect box{kSafeX, 430.0F + (160.0F - h) * 0.5F, w, h};
-            scene_.shadow(box.inset(10.0F), 20.0F, 30.0F, gfx::Color::rgb(0x000000, 0.35F));
+            const gfx::Rect box{280.0F, 78.0F + (88.0F - h) * 0.5F, w, h};
+            scene_.shadow(box.inset(6.0F), 12.0F, 18.0F, gfx::Color::rgb(0x000000, 0.35F));
             scene_.image(logo, box, gfx::kFullUv, kText);
         }
         else
         {
             // Without a logo the title stands in, as the macOS artwork fallback does.
             const ui::FontRef &title_face = font_for(title, fonts_.display);
-            const bool long_title = title_face.font->measure(title, 72.0F) > 900.0F;
-            ui::paragraph(scene_, title_face, title, kSafeX, long_title ? 520.0F : 586.0F, 72.0F, 900.0F, 70.0F,
-                          kText, 2);
+            ui::text(scene_, title_face, title_face.font->fit(title, 44.0F, 720.0F), 280.0F, 140.0F, 44.0F, kText);
+        }
+        if (game != nullptr && (!game->store_developer.empty() || !game->store_release_date.empty()))
+        {
+            std::string identity = game->store_developer;
+            if (!game->store_release_date.empty())
+            {
+                if (!identity.empty()) identity += " · ";
+                identity += game->store_release_date;
+            }
+            const ui::FontRef &face = font_for(identity, fonts_.semibold);
+            ui::text(scene_, face, face.font->fit(identity, 22.0F, 644.0F), 1180.0F, 140.0F, 22.0F, kSecondary);
         }
 
-        // Actions in a row, all one size; Install, Play or a running download is the primary
-        // one, filled with the accent whatever its state.
-        float x = kSafeX;
+        constexpr float stage_x = kSafeX;
+        constexpr float stage_y = 200.0F;
+        constexpr float stage_w = 1040.0F;
+        constexpr float stage_h = 585.0F;
+        constexpr float column_x = 1180.0F;
+        constexpr float column_w = 644.0F;
+        const std::vector<DetailStill> stills = game == nullptr ? std::vector<DetailStill>{} : detail_stills(*game);
+        if (detail_media_game_ != id) {
+            detail_media_game_ = id;
+            detail_media_index_ = 0;
+            detail_media_clock_ = 0.0F;
+        }
+        bool filmstrip_focused = false;
+        if (view.focused_row >= 0 && static_cast<std::size_t>(view.focused_row) < view.rows.size()) {
+            if (const auto chosen = DetailMediaIndex(view.rows[static_cast<std::size_t>(view.focused_row)].key)) {
+                detail_media_index_ = static_cast<int>(*chosen);
+                detail_media_clock_ = 0.0F;
+                filmstrip_focused = true;
+            }
+        }
+        if (stills.empty() || detail_media_index_ < 0 ||
+            static_cast<std::size_t>(detail_media_index_) >= stills.size())
+            detail_media_index_ = 0;
+        const std::string trailer_url = game == nullptr ? std::string() : PlayableTrailerUrl(game->store_trailer_url);
+        const auto trailer_at = [&](int index) {
+            return !stills.empty() && stills[static_cast<std::size_t>(index)].trailer &&
+                   state.navigation.detail_trailer_playing && !state.simulation_mode && !trailer_url.empty();
+        };
+        // The stage walks the filmstrip on its own. Choosing a thumb, playing the trailer, or
+        // reduced motion holds the still that is up.
+        if (!filmstrip_focused && !trailer_at(detail_media_index_) && !state.reduced_motion && stills.size() > 1) {
+            detail_media_clock_ += frame_dt_;
+            if (detail_media_clock_ >= 4.0F) {
+                detail_media_clock_ = 0.0F;
+                detail_media_index_ = (detail_media_index_ + 1) % static_cast<int>(stills.size());
+            }
+        }
+        const int still_index = detail_media_index_;
+        const bool trailer_chosen = !stills.empty() && stills[static_cast<std::size_t>(still_index)].trailer;
+        const bool want_play = trailer_at(still_index);
+        if (want_play)
+            trailer_->Play(trailer_url);
+        else if (trailer_->running())
+            trailer_->Stop();
+        const gfx::Rect stage{stage_x, stage_y, stage_w, stage_h};
+        scene_.rounded_rect(stage, 8.0F, kText.with_alpha(0.06F));
+        if (!stills.empty())
+        {
+            const std::uint32_t video = want_play ? trailer_frame_texture() : 0;
+            const std::uint32_t texture = video != 0 ? video
+                : store_texture(id, stills[static_cast<std::size_t>(still_index)].url);
+            if (texture != 0)
+                scene_.image(texture, stage, gfx::kFullUv, kText, 8.0F);
+            else
+                scene_.rounded_rect(stage, 8.0F, kText.with_alpha(0.08F));
+            if (stills[static_cast<std::size_t>(still_index)].trailer)
+            {
+                scene_.rounded_rect({stage.x + 16.0F, stage.y + stage.h - 52.0F, 118.0F, 36.0F}, 6.0F,
+                                    kBackground.with_alpha(0.72F));
+                ui::text(scene_, fonts_.semibold, "Trailer", stage.x + 32.0F, stage.y + stage.h - 28.0F, 20.0F, kText);
+                trailer_control(stage, want_play);
+            }
+        }
+        else if (state.simulation_mode && hero_ != 0)
+            scene_.image(hero_, stage, gfx::kFullUv, kText, 8.0F);
+        else if (game != nullptr && !game->store_media_known && !state.simulation_mode && game->id.steam_app())
+        {
+            scene_.gradient_rect(stage, 8.0F, id_color(id), gfx::Color::rgb(0x24201D));
+            ui::text(scene_, fonts_.semibold, "Images loading", stage.cx(), stage.cy() + 8.0F, 22.0F, kSecondary,
+                     gfx::Align::center);
+        }
+        else
+            scene_.gradient_rect(stage, 8.0F, id_color(id), gfx::Color::rgb(0x24201D));
+        float thumb_x = stage_x;
+        constexpr float thumb_w = 160.0F;
+        constexpr float thumb_h = 90.0F;
+        const float film_y = stage_y + stage_h + 16.0F;
+        for (std::size_t index = 0; index < stills.size(); ++index)
+        {
+            const gfx::Rect frame{thumb_x, film_y, thumb_w, thumb_h};
+            const std::uint32_t texture = store_texture(id, stills[index].url);
+            if (texture != 0)
+                scene_.image(texture, frame, gfx::kFullUv, kText, 6.0F);
+            else
+                scene_.rounded_rect(frame, 6.0F, kText.with_alpha(0.08F));
+            const std::string key = "details-media-" + std::to_string(index);
+            const bool focused = view.focused_row >= 0 &&
+                                 static_cast<std::size_t>(view.focused_row) < view.rows.size() &&
+                                 view.rows[static_cast<std::size_t>(view.focused_row)].key == key;
+            if (focused && route_focus_)
+                stats_.focused_control_key = key;
+            const float amount = control_focus(key, focused && route_focus_);
+            if (static_cast<int>(index) == still_index)
+                scene_.bordered_rect(frame, 6.0F, kBackground.with_alpha(0.0F), 3.0F, kText);
+            focus_glow(scene_, frame, amount, true);
+            focus_ring(scene_, frame, amount, true);
+            if (stills[index].trailer)
+            {
+                scene_.rounded_rect({frame.x + 6.0F, frame.y + frame.h - 28.0F, 76.0F, 22.0F}, 4.0F,
+                                    kBackground.with_alpha(0.72F));
+                ui::text(scene_, fonts_.semibold, "Trailer", frame.x + 12.0F, frame.y + frame.h - 12.0F, 16.0F, kText);
+            }
+            thumb_x += thumb_w + 12.0F;
+        }
+
+        // The summary sits beside the stage: the blurb, the tags, then Play.
+        const std::string description = game == nullptr || game->description.empty() ?
+                                            "Description unavailable." : game->description;
+        const auto detail_scroll = state.navigation.scroll_offsets.find("details-content");
+        const int description_lines = 4;
+        const std::size_t page_size = DetailsDescriptionPage(state.simulation_mode);
+        const int requested_page = detail_scroll == state.navigation.scroll_offsets.end() ? 0 :
+                                       std::max(0, detail_scroll->second);
+        const int max_page = description.empty() ? 0 : DescriptionPageCount(description, page_size) - 1;
+        const int page = std::min(requested_page, max_page);
+        const std::size_t offset = DescriptionPageOffset(description, page, page_size);
+        const std::size_t end = DescriptionPageEnd(description, offset, page_size);
+        std::string page_text = description.substr(offset, end - offset);
+        if (offset > 0)
+            page_text.insert(0, "…");
+        if (offset + page_size < description.size())
+            page_text += "…";
+        const ui::FontRef &body = font_for(page_text, fonts_.regular);
+        float column_y = stage_y;
+        const float text_bottom = ui::paragraph(scene_, body, page_text, column_x, column_y + 24.0F, 24.0F, column_w, 34.0F,
+                                                gfx::Color::rgb(0xD6D0C8), description_lines);
+        column_y = std::max(column_y + 24.0F + 34.0F, text_bottom) + 8.0F;
+        if (description.size() > page_size)
+        {
+            ui::text(scene_, fonts_.regular, "L2/R2 Read more · page " + std::to_string(page + 1) + " of " +
+                         std::to_string(max_page + 1), column_x, column_y + 16.0F, 18.0F, kMuted);
+            column_y += 28.0F;
+        }
+        float tag_x = column_x;
+        for (const ViewRow &row : view.rows)
+        {
+            if (!DetailChipKey(row.key))
+                continue;
+            const float width = fonts_.semibold.measure(row.title, 20.0F) + 32.0F;
+            if (tag_x + width > column_x + column_w)
+            {
+                tag_x = column_x;
+                column_y += 54.0F;
+            }
+            const bool focused = view.focused_row >= 0 &&
+                                 static_cast<std::size_t>(view.focused_row) < view.rows.size() &&
+                                 view.rows[static_cast<std::size_t>(view.focused_row)].key == row.key;
+            if (focused && route_focus_)
+                stats_.focused_control_key = row.key;
+            const float amount = control_focus(row.key, focused && route_focus_);
+            const gfx::Rect chip{tag_x, column_y, width, 42.0F};
+            const bool more = row.key == "detail-tags-more";
+            focus_glow(scene_, chip, amount, true);
+            scene_.rounded_rect(chip, 6.0F, more ? kText.with_alpha(0.12F)
+                                                 : row.selected ? kAccent.with_alpha(0.55F) : kAccent.with_alpha(0.18F));
+            ui::text(scene_, fonts_.semibold, row.title, tag_x + 16.0F, column_y + 28.0F, 20.0F, kText);
+            focus_ring(scene_, chip, amount, true);
+            tag_x += width + 12.0F;
+        }
+        if (std::any_of(view.rows.begin(), view.rows.end(), [](const ViewRow &row) { return DetailChipKey(row.key); }))
+            column_y += 58.0F;
+        else
+            column_y += 12.0F;
+
+        // Actions under the tags. Install, Play or a running download is the primary one.
+        float x = column_x;
+        float button_y = column_y;
         for (const ViewRow &row : view.rows)
         {
             if (row.kind != RowKind::Action && row.kind != RowKind::Toggle)
                 continue;
-            // Store tags are the chips under the description, not buttons beside Play.
-            if (DetailChipKey(row.key))
+            // Store tags are chips. Filmstrip cells are the stills, not buttons beside Play.
+            if (DetailChipKey(row.key) || DetailMediaKey(row.key))
                 continue;
             const bool primary = row.key == "details-install" || row.key == "details-play" ||
                                  row.key == "details-download";
@@ -3259,7 +3442,12 @@ class Render::Impl
             if (focused && route_focus_)
                 stats_.focused_control_key = row.key;
             const float amount = control_focus(row.key, focused && route_focus_);
-            const gfx::Rect button{x, 682.0F - height * 0.5F, width, height};
+            if (x > column_x && x + width > column_x + column_w)
+            {
+                x = column_x;
+                button_y += height + 12.0F;
+            }
+            const gfx::Rect button{x, button_y, width, height};
             if ((row.key == "details-play" || row.key == "details-download") && row.progress > 0.0F)
             {
                 // Downloading, preparing or removing with a known fraction: the button is not
@@ -3293,169 +3481,73 @@ class Render::Impl
             else
                 mac_button(scene_, button, label, primary, amount, !row.enabled, detail);
             // Wide enough that a focused button's ring (9 px out, 4 px stroke, 4% larger) clears its neighbours.
-            x += width + 26.0F;
+            x += width + 16.0F;
         }
+        column_y = button_y + 76.0F;
 
-        // The setup hint belongs to the actions, with a smaller face and a coloured dot.
-        // Leave a clear gap before the description; ready games have no hint.
-        float y = 774.0F;
-        for (const ViewRow &row : view.rows)
-        {
-            if (row.key != "details-hint" || row.title.empty())
-                continue;
-            scene_.circle(kSafeX + 6.0F, 752.0F, 6.0F, save_tone(row.tone));
-            const ui::FontRef &face = font_for(row.title, fonts_.semibold);
-            ui::text(scene_, face, face.font->fit(row.title, 23.0F, 1100.0F), kSafeX + 26.0F, 760.0F,
-                     23.0F, kText);
-            y += 52.0F;
-            break;
-        }
-        // Non-installed games retain their download, destination and kept-save notes; an imported
-        // game says where it plays from (the fixture's too).
+        // One line under the columns: setup, where an install goes, a download's hidden state, kept saves.
+        std::string note;
+        gfx::Color note_tone = kSecondary;
         const bool folder_note = std::any_of(view.rows.begin(), view.rows.end(), [](const ViewRow &row) {
             return row.key == "details-folder" || row.key == "details-update-note" || row.key == "details-updating";
         });
         if (!state.simulation_mode || folder_note)
         {
-            std::string note;
-            gfx::Color tone = kSecondary;
             for (const ViewRow &row : view.rows)
             {
-                if (row.key.rfind("details-", 0) != 0 || row.key == "details-kept" ||
-                    row.key == "details-hint" || row.key == "details-setup")
-                    continue;
-                if (row.kind == RowKind::Status)
+                if (row.key == "details-hint" && !row.title.empty())
                 {
                     note = row.title;
-                    if (!row.value.empty())
-                        note += " · " + row.value;
-                    if (!row.subtitle.empty())
-                        note += " · " + row.subtitle;
-                    tone = row.title == "Storage disconnected" ? kAmber
-                         : row.key == "details-update-note" || row.key == "details-updating" ? kAccent : kSecondary;
-                    break;
-                }
-                if (row.key == "details-install" && !row.subtitle.empty())
-                {
-                    note = row.subtitle.rfind("To ", 0) == 0 ? "Installs to " + row.subtitle.substr(3) : row.subtitle;
-                    break;
-                }
-                // The Download button already shows the state, or the percentage while it downloads;
-                // only a state hidden behind a percentage (paused, verifying) is said here.
-                if (row.key == "details-download")
-                {
-                    if (row.progress > 0.0F && row.value != "downloading" && row.value != "copying")
-                        note = row.title + " " + row.value;  // "Download paused", "Copying paused"
+                    note_tone = save_tone(row.tone);
                     break;
                 }
             }
-            if (!note.empty())
+            if (note.empty())
             {
-                ui::text(scene_, fonts_.semibold, fit(fonts_.semibold, note, 22.0F, 1128.0F), kSafeX, y + 4.0F, 22.0F,
-                         tone);
-                y += 42.0F;
+                for (const ViewRow &row : view.rows)
+                {
+                    if (row.key.rfind("details-", 0) != 0 || row.key == "details-kept" ||
+                        row.key == "details-hint" || row.key == "details-setup")
+                        continue;
+                    if (row.kind == RowKind::Status)
+                    {
+                        note = row.title;
+                        if (!row.value.empty())
+                            note += " · " + row.value;
+                        if (!row.subtitle.empty())
+                            note += " · " + row.subtitle;
+                        note_tone = row.title == "Storage disconnected" ? kAmber
+                             : row.key == "details-update-note" || row.key == "details-updating" ? kAccent : kSecondary;
+                        break;
+                    }
+                    if (row.key == "details-install" && !row.subtitle.empty())
+                    {
+                        note = row.subtitle.rfind("To ", 0) == 0 ? "Installs to " + row.subtitle.substr(3) : row.subtitle;
+                        break;
+                    }
+                    if (row.key == "details-download")
+                    {
+                        if (row.progress > 0.0F && row.value != "downloading" && row.value != "copying")
+                            note = row.title + " " + row.value;
+                        break;
+                    }
+                }
             }
-            // Saves kept from a previous install, under the install note.
             for (const ViewRow &row : view.rows)
             {
                 if (row.key != "details-kept")
                     continue;
-                std::string kept_note = row.title;
+                if (!note.empty())
+                    note += " · ";
+                note += row.title;
                 if (!row.value.empty())
-                    kept_note += " · " + row.value;
+                    note += " · " + row.value;
                 if (!row.subtitle.empty())
-                    kept_note += " · " + row.subtitle;
-                ui::text(scene_, fonts_.semibold, fit(fonts_.semibold, kept_note, 22.0F, 1128.0F), kSafeX, y + 4.0F,
-                         22.0F, kSecondary);
-                y += 42.0F;
-            }
-        }
-        const std::string description = game == nullptr || game->description.empty() ?
-                                            "Description unavailable." : game->description;
-        const auto detail_scroll = state.navigation.scroll_offsets.find("details-content");
-        // Keep description pagination aligned with the model and above the footer hints.
-        constexpr float column_bottom = 975.0F;
-        const int description_lines = state.simulation_mode ? 3 : 2;
-        const std::size_t page_size = DetailsDescriptionPage(state.simulation_mode);
-        const int requested_page = detail_scroll == state.navigation.scroll_offsets.end() ? 0 :
-                                       std::max(0, detail_scroll->second);
-        const int max_page = description.empty() ? 0 :
-                                 static_cast<int>((description.size() - 1) / page_size);
-        const int page = std::min(requested_page, max_page);
-        const std::size_t offset = utf8_boundary(description, static_cast<std::size_t>(page) * page_size);
-        const std::size_t end = utf8_boundary(description, std::min(description.size(), offset + page_size));
-        std::string page_text = description.substr(offset, end - offset);
-        if (offset > 0)
-            page_text.insert(0, "…");
-        if (offset + page_size < description.size())
-            page_text += "…";
-        const ui::FontRef &body = font_for(page_text, fonts_.regular);
-        const float text_bottom = ui::paragraph(scene_, body, page_text, kSafeX, y + 20.0F, 26.0F, 1128.0F, 37.0F,
-                                                gfx::Color::rgb(0xD6D0C8), description_lines);
-        y = std::max(y + 20.0F + 37.0F, text_bottom) + 18.0F;
-        if (description.size() > page_size)
-        {
-            ui::text(scene_, fonts_.regular, "L2/R2 Read more · page " + std::to_string(page + 1) + " of " +
-                         std::to_string(max_page + 1), kSafeX, y + 6.0F, 18.0F, kMuted);
-            y += 30.0F;
-        }
-        if (game != nullptr && y + 42.0F <= column_bottom)
-        {
-            std::vector<std::string> media;
-            if (!game->store_trailer_thumbnail.empty()) media.push_back(game->store_trailer_thumbnail);
-            for (const std::string &shot : game->store_screenshots) {
-                if (media.size() >= 4) break;
-                media.push_back(shot);
-            }
-            const bool has_chips = std::any_of(view.rows.begin(), view.rows.end(),
-                                                [](const ViewRow &row) { return DetailChipKey(row.key); });
-            // Keep a band for the chips when the shots would push them off the page.
-            if (!media.empty() && y + 128.0F + (has_chips ? 108.0F : 0.0F) <= column_bottom)
-            {
-                float media_x = kSafeX;
-                for (const std::string &url : media)
-                {
-                    const gfx::Rect frame{media_x, y, 248.0F, 116.0F};
-                    const std::uint32_t texture = store_texture(game->id, url);
-                    if (texture != 0)
-                        scene_.image(texture, frame, gfx::kFullUv, kText, 6.0F);
-                    else
-                        scene_.rounded_rect(frame, 6.0F, kText.with_alpha(0.08F));
-                    media_x += 260.0F;
-                }
-                y += 128.0F;
-            }
-            float tag_x = kSafeX;
-            for (const ViewRow &row : view.rows)
-            {
-                if (!DetailChipKey(row.key))
-                    continue;
-                const float width = fonts_.semibold.measure(row.title, 20.0F) + 32.0F;
-                if (tag_x + width > kSafeX + 1128.0F)
-                {
-                    tag_x = kSafeX;
-                    y += 54.0F;
-                    if (y + 42.0F > column_bottom)
-                        break;
-                }
-                const bool focused = view.focused_row >= 0 &&
-                                     static_cast<std::size_t>(view.focused_row) < view.rows.size() &&
-                                     view.rows[static_cast<std::size_t>(view.focused_row)].key == row.key;
-                if (focused && route_focus_)
-                    stats_.focused_control_key = row.key;
-                const float amount = control_focus(row.key, focused && route_focus_);
-                const gfx::Rect chip{tag_x, y, width, 42.0F};
-                const bool more = row.key == "detail-tags-more";
-                focus_glow(scene_, chip, amount, true);
-                scene_.rounded_rect(chip, 6.0F, more ? kText.with_alpha(0.12F)
-                                                     : row.selected ? kAccent.with_alpha(0.55F) : kAccent.with_alpha(0.18F));
-                ui::text(scene_, fonts_.semibold, row.title, tag_x + 16.0F, y + 28.0F, 20.0F, kText);
-                focus_ring(scene_, chip, amount, true);
-                tag_x += width + 16.0F;
+                    note += " · " + row.subtitle;
             }
         }
 
-        // Right column: the facts.
+        // Facts under the actions, in the same column as the description.
         if (game == nullptr)
             return;
         const Installation *installation = nullptr;
@@ -3508,12 +3600,11 @@ class Render::Impl
             compat.resize(dot);
         std::string controller = game->controller_support.empty() ? "Unknown" : game->controller_support;
         controller.front() = static_cast<char>(std::toupper(static_cast<unsigned char>(controller.front())));
-        constexpr float left = 1304.0F;
-        constexpr float right = 1584.0F;
+        const float left = column_x;
+        const float right = column_x + 320.0F;
         const auto setup = std::find_if(view.rows.begin(), view.rows.end(), [](const ViewRow &row) {
             return row.key == "details-setup";
         });
-        // Progress reads "Step 3 of 6 · Copying …": the step on one line, what it does below it.
         std::string setup_step, setup_detail;
         if (setup != view.rows.end()) {
             setup_step = setup->value;
@@ -3522,29 +3613,35 @@ class Render::Impl
                 setup_step.resize(dot);
             }
         }
-        const float facts_top = setup == view.rows.end() ? 754.0F : setup_detail.empty() ? 694.0F : 662.0F;
-        detail_cell("Playtime", playtime, left, facts_top, 240.0F);
-        detail_cell("Size", size, right, facts_top, 240.0F);
+        const float facts_top = column_y;
+        detail_cell("Playtime", playtime, left, facts_top, 300.0F);
+        detail_cell("Size", size, right, facts_top, 300.0F);
         // A game a Steam family member shares comes from Steam Families, not the account's own library.
         const std::string store = game->id.store == Store::kLocal ? std::string("Imported") :
                                   game->family_shared ? std::string("Steam Family") :
                                   game->source.empty() ? std::string("Steam") : game->source;
-        detail_cell("Store", store, left, facts_top + 76.0F, 240.0F);
-        detail_cell("Location", location, right, facts_top + 76.0F, 240.0F);
-        detail_cell("Compatibility", compat, left, facts_top + 152.0F, 240.0F);
+        detail_cell("Store", store, left, facts_top + 72.0F, 300.0F);
+        detail_cell("Location", location, right, facts_top + 72.0F, 300.0F);
+        detail_cell("Compatibility", compat, left, facts_top + 144.0F, 300.0F);
         if (game->last_played && setup == view.rows.end())
             detail_cell("Last played", relative_time(game->last_played, state.clock_ticks), right,
-                        facts_top + 152.0F, 240.0F);
+                        facts_top + 144.0F, 300.0F);
         else
-            detail_cell("Controller", controller, right, facts_top + 152.0F, 240.0F);
-        if (setup != view.rows.end()) {
-            const gfx::Color tone = setup->tone.empty() || setup->tone == "quiet" ? kText : save_tone(setup->tone);
-            detail_cell("Setup", setup_step, left, facts_top + 228.0F, 520.0F, tone);
-            if (!setup_detail.empty()) {
-                const ui::FontRef &face = font_for(setup_detail, fonts_.regular);
-                ui::text(scene_, face, face.font->fit(setup_detail, 24.0F, 520.0F), left, facts_top + 228.0F + 84.0F,
-                         24.0F, kSecondary);
-            }
+            detail_cell("Controller", controller, right, facts_top + 144.0F, 300.0F);
+        if (setup != view.rows.end())
+        {
+            if (!note.empty())
+                note += " · ";
+            note += setup_step;
+            if (!setup_detail.empty())
+                note += " · " + setup_detail;
+            if (setup->tone == "problem" || setup->tone == "attention")
+                note_tone = save_tone(setup->tone);
+        }
+        if (!note.empty())
+        {
+            const ui::FontRef &face = font_for(note, fonts_.semibold);
+            ui::text(scene_, face, face.font->fit(note, 22.0F, 1728.0F), kSafeX, 948.0F, 22.0F, note_tone);
         }
     }
 
@@ -4623,6 +4720,60 @@ class Render::Impl
     int keyboard_layouts_ = 0;  // 0 the default layouts, 1 a password's (Show), 2 a revealed password's (Hide)
     std::array<std::uint32_t, 8> art_{};
     std::uint32_t hero_ = 0;
+    std::unique_ptr<TrailerPlayer> trailer_ = std::make_unique<TrailerPlayer>();
+    std::uint32_t trailer_texture_ = 0;
+    std::uint32_t trailer_w_ = 0;
+    std::uint32_t trailer_h_ = 0;
+    std::uint64_t trailer_serial_ = 0;
+    GameId detail_media_game_{};
+    int detail_media_index_ = 0;
+    float detail_media_clock_ = 0.0F;
+
+    void trailer_control(const gfx::Rect &stage, bool playing)
+    {
+        const float cx = stage.cx();
+        const float cy = stage.cy();
+        scene_.circle(cx, cy, 46.0F, kBackground.with_alpha(0.72F));
+        if (playing)
+        {
+            scene_.rounded_rect({cx - 13.0F, cy - 14.0F, 8.0F, 28.0F}, 2.0F, kText);
+            scene_.rounded_rect({cx + 5.0F, cy - 14.0F, 8.0F, 28.0F}, 2.0F, kText);
+        }
+        else
+        {
+            // The shape points up. A quarter turn points it right, and the
+            // nudge puts its weight in the middle of the plate.
+            constexpr float kSize = 34.0F;
+            scene_.triangle({cx - kSize * 0.5F + 4.0F, cy - kSize * 0.5F, kSize, kSize}, kText, 0.0F,
+                            1.5707963F);
+        }
+    }
+
+    std::uint32_t trailer_frame_texture()
+    {
+        std::vector<std::uint8_t> rgba;
+        std::uint32_t width = 0;
+        std::uint32_t height = 0;
+        if (!trailer_->TakeFrame(rgba, width, height, trailer_serial_))
+            return trailer_texture_;
+        if (width == 0 || height == 0 || rgba.size() < static_cast<std::size_t>(width) * height * 4u)
+            return trailer_texture_;
+        if (trailer_texture_ != 0 && width == trailer_w_ && height == trailer_h_)
+        {
+            glBindTexture(GL_TEXTURE_2D, trailer_texture_);
+            glPixelStorei(GL_UNPACK_ALIGNMENT, 4);
+            glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, static_cast<GLsizei>(width), static_cast<GLsizei>(height),
+                            GL_RGBA, GL_UNSIGNED_BYTE, rgba.data());
+            return trailer_texture_;
+        }
+        if (trailer_texture_ != 0)
+            glDeleteTextures(1, &trailer_texture_);
+        trailer_texture_ = renderer_.batch().create_texture(static_cast<int>(width), static_cast<int>(height),
+                                                            rgba.data());
+        trailer_w_ = width;
+        trailer_h_ = height;
+        return trailer_texture_;
+    }
     std::string cached_qr_url_;
     QrMatrix cached_qr_;
     std::string cached_qr_error_;

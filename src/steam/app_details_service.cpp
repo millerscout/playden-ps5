@@ -1,6 +1,7 @@
 #include "steam/app_details_service.h"
 
 #include <algorithm>
+#include <chrono>
 #include <iterator>
 
 namespace playden::steam {
@@ -16,24 +17,29 @@ void AppDetailsService::Request(GameId id, std::uint64_t account_generation, boo
   if (stopping_) return;
   if (account_generation != generation_) Reset(account_generation);
   if (requested_.count(id)) {
-    // Queued already: it goes first. In flight or answered: nothing to do.
-    if (const auto queued = std::find(pending_.begin(), pending_.end(), id); first && queued != pending_.end()) {
+    // Queued already: it goes first, keeping the time it was first queued. In flight or answered: nothing to do.
+    if (const auto queued = std::find_if(pending_.begin(), pending_.end(),
+                                         [id](const QueuedGame& item) { return item.id == id; });
+        first && queued != pending_.end()) {
+      const auto item = *queued;
       pending_.erase(queued);
-      pending_.push_front(id);
+      pending_.push_front(item);
     }
     return;
   }
   if (pending_.size() >= kMaxPending && !first) return;
   requested_.insert(id);
-  if (first) pending_.push_front(id);
-  else pending_.push_back(id);
+  const QueuedGame item{id, std::chrono::steady_clock::now()};
+  if (first) pending_.push_front(item);
+  else pending_.push_back(item);
   wake_.notify_all();
 }
 
 void AppDetailsService::Refresh(GameId id, std::uint64_t account_generation, bool first) {
   {
     std::lock_guard<std::mutex> lock(mutex_);
-    if (account_generation == generation_ && std::find(pending_.begin(), pending_.end(), id) == pending_.end())
+    if (account_generation == generation_ &&
+        std::none_of(pending_.begin(), pending_.end(), [id](const QueuedGame& item) { return item.id == id; }))
       requested_.erase(id);
   }
   Request(id, account_generation, first);
@@ -72,7 +78,8 @@ bool AppDetailsService::CheckInstalled(const std::vector<GameId>& ids, std::uint
   ++check_serial_;
   std::set<GameId> seen;
   for (const auto& id : ids)
-    if (id.steam_app() && seen.insert(id).second) check_pending_.push_back(id);
+    if (id.steam_app() && seen.insert(id).second)
+      check_pending_.push_back(QueuedGame{id, std::chrono::steady_clock::now()});
   check_.account_generation = account_generation;
   check_.total = check_pending_.size();
   wake_.notify_all();
@@ -106,6 +113,11 @@ bool AppDetailsService::Measure(SizeRequest request, std::uint64_t account_gener
   }
   wake_.notify_all();
   return true;
+}
+
+void AppDetailsService::SetLog(std::function<void(const std::string&)> log) {
+  std::lock_guard<std::mutex> lock(mutex_);
+  log_ = std::move(log);
 }
 
 std::vector<MeasuredSize> AppDetailsService::PumpMeasured() {
@@ -148,35 +160,52 @@ void AppDetailsService::Shutdown() {
 void AppDetailsService::Run() {
   for (;;) {
     std::vector<GameId> batch;
+    std::vector<std::chrono::steady_clock::time_point> enqueued_at;
     std::set<GameId> checked;  // the games the check asked for in this batch
     std::uint64_t generation = 0, check = 0;
+    std::function<void(const std::string&)> log;
     {
       std::unique_lock<std::mutex> lock(mutex_);
       wake_.wait(lock, [this] { return stopping_ || !pending_.empty() || !check_pending_.empty(); });
       if (stopping_) return;
       while (!pending_.empty() && batch.size() < kBatch) {
-        batch.push_back(pending_.front());
+        batch.push_back(pending_.front().id);
+        enqueued_at.push_back(pending_.front().enqueued);
         pending_.pop_front();
       }
       // The installed check fills what the queue leaves: it waits behind every request, a page's included.
       while (!check_pending_.empty() && batch.size() < kBatch) {
-        const auto id = check_pending_.front();
+        const auto item = check_pending_.front();
         check_pending_.pop_front();
         ++check_.asked;
-        check_waiting_.insert(id);
-        checked.insert(id);
-        requested_.insert(id);
-        if (std::find(batch.begin(), batch.end(), id) == batch.end()) batch.push_back(id);
+        check_waiting_.insert(item.id);
+        checked.insert(item.id);
+        requested_.insert(item.id);
+        if (std::find(batch.begin(), batch.end(), item.id) == batch.end()) {
+          batch.push_back(item.id);
+          enqueued_at.push_back(item.enqueued);
+        }
       }
       generation = generation_;
       check = check_serial_;
+      log = log_;
       cancel_.store(false, std::memory_order_release);
+    }
+    const auto fetch_started = std::chrono::steady_clock::now();
+    std::int64_t queue_ms = 0;
+    for (const auto at : enqueued_at) {
+      const auto waited = std::chrono::duration_cast<std::chrono::milliseconds>(fetch_started - at).count();
+      if (waited > queue_ms) queue_ms = waited;
     }
     std::vector<AppDetails> fetched;
     const auto session = sessions_.Load();
     if (session.ok() && session.value()) {
       fetched = source_.Fetch(*session.value(), batch, cancel_);
     }
+    if (log)
+      log("step=details-queue count=" + std::to_string(batch.size()) + " queue_ms=" + std::to_string(queue_ms) +
+          " fetch_ms=" +
+          std::to_string(std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - fetch_started).count()));
     std::lock_guard<std::mutex> lock(mutex_);
     if (stopping_) return;
     if (generation != generation_ || cancel_.load(std::memory_order_acquire)) continue;

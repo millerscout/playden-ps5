@@ -412,6 +412,7 @@ int main() {
         details_source.SetContentLanguage([] { return selected_content_language(); });
         playden::LocalSessionRepository details_sessions(user_root, {}, &session_vault);
         playden::steam::AppDetailsService app_details(details_source, details_sessions);
+        app_details.SetLog([](const std::string& line) { playden::app::AppendLogLine(log_root, "install.log", line); });
         playden::steam::CmClient install_cm(paths.trust_store, library_storage);
         install_cm.SetOwner("install");
         install_cm.SetSharedSession(steam_cm);
@@ -992,6 +993,11 @@ int main() {
         playden::homebrew::Render renderer(paths.assets_root);
 #else
         playden::homebrew::HttpArtworkBackend artwork_backend(paths.trust_store, art_cache_dir);
+        auto media_log = [](const std::string& line) {
+            playden::app::AppendLogLine(log_root, "artwork.log", line);
+        };
+        artwork_backend.SetLog(media_log);
+        services.SetStoreMediaLog(media_log);
         // Games without store art show the icon inside their program, read from the game's files.
         playden::homebrew::ProgramIconArtworkBackend program_icons(artwork_backend);
         playden::homebrew::ArtworkService artwork(program_icons);

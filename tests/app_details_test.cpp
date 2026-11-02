@@ -6,6 +6,7 @@
 #include <cassert>
 #include <chrono>
 #include <mutex>
+#include <string>
 #include <thread>
 #include "steam_id.h"
 
@@ -70,6 +71,46 @@ std::vector<AppDetails> Await(AppDetailsService& service, std::size_t count) {
   }
   assert(all.size() >= count);
   return all;
+}
+
+// A game opened while another fetch is still running waits, and the log says for how long.
+void QueueWaitIsLogged() {
+  Sessions sessions;
+  Source source;
+  source.block_fetch = true;
+  AppDetailsService service(source, sessions);
+  std::mutex log_mutex;
+  std::vector<std::string> lines;
+  service.SetLog([&](const std::string& line) {
+    std::lock_guard<std::mutex> lock(log_mutex);
+    lines.push_back(line);
+  });
+  service.Request(SteamId(1), 1);
+  const auto started = std::chrono::steady_clock::now();
+  while (std::chrono::steady_clock::now() - started < 2s) {
+    std::lock_guard<std::mutex> lock(source.mutex);
+    if (!source.calls.empty()) break;
+    std::this_thread::sleep_for(1ms);
+  }
+  {
+    std::lock_guard<std::mutex> lock(source.mutex);
+    assert(source.calls.size() == 1);
+  }
+  service.Request(SteamId(2), 1);
+  std::this_thread::sleep_for(100ms);
+  source.block_fetch = false;
+  Await(service, 2);
+  std::lock_guard<std::mutex> lock(log_mutex);
+  assert(lines.size() >= 2);
+  long long longest = 0;
+  for (const auto& line : lines) {
+    assert(line.find("step=details-queue ") == 0);
+    const auto fetch = line.find("fetch_ms=");
+    const auto queue = line.find("queue_ms=");
+    assert(fetch != std::string::npos && queue != std::string::npos);
+    longest = std::max(longest, std::stoll(line.c_str() + queue + std::char_traits<char>::length("queue_ms=")));
+  }
+  assert(longest >= 50);
 }
 
 void RequestsAreDeduplicatedPerGeneration() {
@@ -768,6 +809,7 @@ int main() {
   OpenedGameGoesFirst();
   LargeOverlappingDepotsAreMeasured();
   SizesCountOnlyLicensedDepots();
+  QueueWaitIsLogged();
   RequestsAreDeduplicatedPerGeneration();
   NewGenerationDropsResultsAndRefetches();
   SameGenerationInvalidateRefetches();

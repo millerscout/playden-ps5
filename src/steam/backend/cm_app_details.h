@@ -41,7 +41,8 @@ class CmAppDetailsSource final : public AppDetailsSource {
     measure_client_ = client;
   }
   // Optional: lines for the install log, never identifiers beyond app and depot IDs. Step "details": one per game a
-  // fetch answers (result ok, missing or failed, with the time Steam took). Step "size": one per size check, result
+  // fetch answers (result ok, missing or failed, with the time Steam took for the game's appinfo, `ms`, and for its
+  // DLC apps' appinfo, `dlc_ms` and `dlc`). Step "size": one per size check, result
   // fetched (the manifests were read), cached, skipped (Steam's sum stands: fewer than two large depots) or failed,
   // with the choice, the sizes and the time taken.
   void SetLog(std::function<void(std::uint32_t app, const char* step, const char* result, const std::string& detail)> log) {
