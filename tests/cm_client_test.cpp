@@ -621,6 +621,111 @@ void SavedLicenseGrantIsReusedForAnHour() {
   std::filesystem::remove_all(root);
 }
 
+// Package 0 is a real license, but it is not stored. An older file that saved it first used to fail the
+// whole grant, so the next read fetched every package again.
+void PackageZeroDoesNotDiscardTheSavedGrant() {
+  const auto root = std::filesystem::temp_directory_path() / "playden-license-package-zero-test";
+  std::filesystem::remove_all(root);
+  std::filesystem::create_directories(root);
+  Storage storage(root.string());
+  assert(storage.EnsureRootDirectory().ok());
+  const PackageContentsMap contents{{0, {{1}, {2}}}, {100, {{10}, {11}}}};
+  auto answering = [&] {
+    auto script = LicenseScript({{0, 1240000000, 0, 4242, 0}, {100, 1600000000, 0, 4242, 0}}, contents);
+    script->changes_reply = [](const cm::Frame& request) { return PicsChangesResponse(request, 80, true, {}); };
+    return script;
+  };
+  std::atomic<bool> cancel{false};
+  {
+    auto script = answering();
+    auto client = MakeClient(script);
+    client.SetPackageCache(&storage);
+    const auto result = client.FetchAcquisitionDates(Session(), cancel);
+    assert(result.ok());
+    assert(result.owned_apps == (std::set<std::uint32_t>{1, 10}));
+    assert(result.package_apps.count(0) == 1);
+    assert(result.acquired_at.at(10) == 1600000000u);
+  }
+  {
+    auto script = std::make_shared<Script>();
+    auto client = MakeClient(script, 400);
+    client.SetPackageCache(&storage);
+    const auto result = client.FetchAcquisitionDates(Session(), cancel);
+    assert(result.ok() && result.fetched_at == 1700000000u);
+    assert(result.owned_apps == (std::set<std::uint32_t>{10}));
+    assert(result.package_apps.count(0) == 0);
+    assert(result.package_apps.at(100) == (std::vector<std::uint32_t>{10}));
+    assert(result.package_depots.at(100) == (std::vector<std::uint32_t>{11}));
+    assert(result.acquired_at.at(10) == 1600000000u);
+    std::lock_guard<std::mutex> lock(script->mutex);
+    assert(script->sent.empty());
+  }
+  std::filesystem::remove_all(root);
+}
+
+void AppendPackageNumber(std::vector<std::uint8_t>& out, std::uint64_t value, unsigned count) {
+  for (unsigned i = 0; i < count; ++i) {
+    out.push_back(static_cast<std::uint8_t>(value));
+    value >>= 8;
+  }
+}
+
+// The same CRC-32 the package cache loader checks.
+std::uint32_t PackageCacheChecksum(const std::vector<std::uint8_t>& bytes, std::size_t size) {
+  std::uint32_t crc = 0xffffffffu;
+  for (std::size_t i = 0; i < size; ++i) {
+    crc ^= bytes[i];
+    for (int bit = 0; bit < 8; ++bit) crc = (crc >> 1) ^ (0xedb88320u & (0u - (crc & 1u)));
+  }
+  return ~crc;
+}
+
+void AppendPackageEntry(std::vector<std::uint8_t>& out, std::uint32_t id, std::uint32_t created,
+                        const std::vector<std::uint32_t>& apps, const std::vector<std::uint32_t>& depots) {
+  AppendPackageNumber(out, id, 4);
+  AppendPackageNumber(out, 1, 4);
+  AppendPackageNumber(out, 0, 4);
+  AppendPackageNumber(out, created, 4);
+  AppendPackageNumber(out, apps.size(), 4);
+  for (const auto app : apps) AppendPackageNumber(out, app, 4);
+  AppendPackageNumber(out, depots.size(), 4);
+  for (const auto depot : depots) AppendPackageNumber(out, depot, 4);
+}
+
+// A file written before package 0 was left out. The id used to fail the whole grant.
+void OlderPackageZeroGrantStillLoads() {
+  const auto root = std::filesystem::temp_directory_path() / "playden-license-package-zero-old-file";
+  std::filesystem::remove_all(root);
+  std::filesystem::create_directories(root);
+  Storage storage(root.string());
+  assert(storage.EnsureRootDirectory().ok());
+  std::vector<std::uint8_t> file{'P', 'D', 'N', 'P', 'K', 'G', 0, 3};
+  AppendPackageNumber(file, kAccountSteamId, 8);
+  AppendPackageNumber(file, 80, 4);
+  AppendPackageNumber(file, 1700000000ull, 8);
+  AppendPackageNumber(file, 0, 8);
+  AppendPackageNumber(file, 2, 4);
+  AppendPackageEntry(file, 0, 1240000000u, {1}, {2});
+  AppendPackageEntry(file, 100, 1600000000u, {10}, {11});
+  AppendPackageNumber(file, PackageCacheChecksum(file, file.size()), 4);
+  assert(storage.WriteAtomic("package-contents.cache", file).ok());
+
+  std::atomic<bool> cancel{false};
+  auto script = std::make_shared<Script>();
+  auto client = MakeClient(script, 400);
+  client.SetPackageCache(&storage);
+  const auto result = client.FetchAcquisitionDates(Session(), cancel);
+  assert(result.ok() && result.fetched_at == 1700000000u);
+  assert(result.owned_apps == (std::set<std::uint32_t>{10}));
+  assert(result.package_apps.count(0) == 0);
+  assert(result.package_apps.at(100) == (std::vector<std::uint32_t>{10}));
+  assert(result.package_depots.at(100) == (std::vector<std::uint32_t>{11}));
+  assert(result.acquired_at.at(10) == 1600000000u);
+  std::lock_guard<std::mutex> lock(script->mutex);
+  assert(script->sent.empty());
+  std::filesystem::remove_all(root);
+}
+
 // A file hit rebuilds purchase dates: a borrowed app keeps the shared license's date, and an app the
 // account also owns keeps the account's own date.
 void CachedPurchaseDatesPreferTheAccountsOwnLicense() {
@@ -1590,6 +1695,8 @@ int main(int argc, char** argv) {
   ResetCmBackoff();
   CachedPackagesAreFetchedOnlyWhenChanged();
   SavedLicenseGrantIsReusedForAnHour();
+  PackageZeroDoesNotDiscardTheSavedGrant();
+  OlderPackageZeroGrantStillLoads();
   CachedPurchaseDatesPreferTheAccountsOwnLicense();
   PushedLicensesBypassTheHour();
   PackageZeroCounts();
