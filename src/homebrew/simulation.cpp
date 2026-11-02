@@ -566,7 +566,7 @@ std::string action_label(const std::string& key) {
         {"sort-name", "Name"}, {"sort-recent-played", "Recently played"}, {"sort-recent-added", "Recently added"},
         {"sort-playtime", "Playtime"}, {"sort-install-size", "Install size"}, {"filter-installed", "Installed"},
         {"filter-genre-adventure", "Adventure"}, {"filter-controller-full", "Full controller support"},
-        {"filter-compat-playable", "Playable"}, {"filter-hide-demos", "Demos"}, {"filter-hide-family", "Family sharing"}, {"library-tags", "Tags"}, {"filters-reset", "Reset filters"}, {"refresh-library", "Refresh library"}, {"advance-clock", "Advance fixture clock"},
+        {"filter-compat-playable", "Playable"}, {"filter-hide-demos", "Demos"}, {"filter-hide-family", "Family sharing"}, {"filter-free", "Free games"}, {"library-tags", "Tags"}, {"filters-reset", "Reset filters"}, {"refresh-library", "Refresh library"}, {"advance-clock", "Advance fixture clock"},
         {"inject-download-failed", "Inject download failure"}, {"inject-verification-failed", "Inject verification failure"},
         {"inject-uninstall-failed", "Inject uninstall failure"},
         {"inject-storage-disconnect", "Disconnect storage"}, {"inject-controller-disconnect", "Disconnect controller"},
@@ -3591,6 +3591,7 @@ bool Simulation::UpdateLibrary(LibraryUpdate update) {
                 game.added_at = static_cast<std::int64_t>(*summary.added_at_unix_seconds);
             game.demo = summary.demo;
             game.family_shared = summary.family_shared;
+            game.free = summary.free;
             game.store_tags = summary.store_tags;
             game.store_tags_known = summary.store_tags_known;
             if (const auto facts = store_facts_.find(game.id); facts != store_facts_.end()) {
@@ -4448,6 +4449,7 @@ void Simulation::load_fixtures() {
             game.playtime_minutes = optional_uint(item.get("playtime_minutes"));
             game.demo = bool_value(item.get("demo"));
             game.family_shared = bool_value(item.get("family_shared"));
+            game.free = bool_value(item.get("free"));
             state_.games.push_back(std::move(game));
         }
     }
@@ -5818,8 +5820,8 @@ void Simulation::rebuild_view() {
                 item.value = playden::steam::LanguageName(install_language(id));
                 item.subtitle = install_language_.empty() ? "From Settings › Downloads" : "This game only";
             }
-            // Every library filter is a toggle. Demos and Family sharing are on unless the player hid them;
-            // the others (Playable) narrow the library while on.
+            // Every library filter is a toggle. Demos and Family sharing are on unless the player hid them.
+            // Free games are off until the player shows them. The others (Playable) narrow the library while on.
             if (modal.id == "filters" && action_key.rfind("filter-", 0) == 0) {
                 const bool hide = action_key == "filter-hide-demos" || action_key == "filter-hide-family";
                 item.kind = RowKind::Toggle;
@@ -10774,11 +10776,15 @@ bool Simulation::action(const std::string& logical_action) {
             std::vector<std::string> filters = live()
                 ? std::vector<std::string>{"filter-compat-playable"}
                 : std::vector<std::string>{"filter-installed", "filter-genre-adventure", "filter-controller-full", "filter-compat-playable"};
-            // Family sharing likewise, for games a Steam family member shares.
+            // Family sharing likewise, for games a Steam family member shares. Free games likewise, for
+            // license-only games; that toggle stays off until the player turns it on.
             const bool family = state_.library.filters.contains("hide-family") ||
                 std::any_of(state_.games.begin(), state_.games.end(), [](const Game& game) { return game.family_shared; });
+            const bool free = state_.library.filters.contains("free") ||
+                std::any_of(state_.games.begin(), state_.games.end(), [](const Game& game) { return game.free; });
             if (demos) filters.push_back("filter-hide-demos");
             if (family) filters.push_back("filter-hide-family");
+            if (free) filters.push_back("filter-free");
             if (library_has_tags()) filters.push_back("library-tags");
             if (!state_.library.tag_filters.empty()) filters.push_back("filter-tag-clear");
             std::vector<std::string> actions{"heading-sort"};

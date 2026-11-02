@@ -1278,6 +1278,34 @@ void live_family_filter_defaults_on() {
           "turning Family sharing on shows it again");
 }
 
+// Free games stay out of the grid until the toggle is on. The row is listed only while the library has one,
+// or while the filter is on so it can be turned off.
+void live_free_filter_defaults_off() {
+    auto model=make_live();
+    model.UpdateAccount({AuthState::SignedIn,"123","Synthetic",{},{},true});
+    check(model.UpdateLibrary({{game(SteamId(42),"Synthetic")},false,{},false,false,{}}),"library without free games loaded");
+    check(model.action("r1") && model.action("triangle"),"live filter modal opens");
+    check(find_row(model,"filter-free")==nullptr,"a library without free games has no Free games row");
+    model.action("circle");
+
+    auto license=game(SteamId(43),"Synthetic Free");license.free=true;
+    check(model.UpdateLibrary({{game(SteamId(42),"Synthetic"),license},false,{},false,false,{}}),"library with a free game loaded");
+    check(model.visible_games().size()==1 && model.visible_games().front()->id==SteamId(42),"free games are hidden");
+    check(model.action("triangle"),"filter modal opens");
+    const auto* row=find_row(model,"filter-free");
+    check(row!=nullptr && row->title=="Free games" && row->kind==RowKind::Toggle && !row->selected && row->value=="Off",
+          "Free games is a toggle, off");
+    activate(model,"filter-free");
+    check(model.visible_games().size()==2 && model.ExportOrganization().filters==std::set<std::string>{"free"},
+          "turning Free games on shows the license-only game and is saved");
+    check(model.action("triangle"),"filter modal opens again");
+    row=find_row(model,"filter-free");
+    check(row!=nullptr && row->selected && row->value=="On","Free games shows on");
+    activate(model,"filter-free");
+    check(model.visible_games().size()==1 && model.ExportOrganization().filters.empty(),
+          "turning Free games off hides it again");
+}
+
 // Sort and filters offers Refresh library: it asks the controller for Steam's current list and the
 // Library stays on screen. While a refresh runs, the row waits.
 void live_sort_sheet_refreshes_the_library() {
@@ -4328,6 +4356,7 @@ int main() {
     live_demos_filter_defaults_on();
     live_family_shared_projected();
     live_family_filter_defaults_on();
+    live_free_filter_defaults_off();
     live_sort_sheet_refreshes_the_library();
     continue_playing_more_keeps_the_chosen_sort();
     live_empty_filter_keeps_the_signed_in_account();

@@ -404,9 +404,19 @@ void V2RoundTripsEveryStore() {
   v1_demos.schema_version = 1;
   v1_demos.filters = {"hide-demos"};
   Check(!store.SaveV1(kFirstAccount, v1_demos).ok(), "version 1 cannot hold hidden demos");
-  auto three_filters = expected;
-  three_filters.filters.insert("controller-full");
-  Check(!store.Save(kDevice, three_filters).ok(), "version 2 holds at most Playable, hidden demos and hidden family games");
+  auto with_free = expected;
+  with_free.filters.insert("free");
+  Check(store.Save(kDevice, with_free).ok(), "free games filter saves beside the other three");
+  const auto free_restored = store.Load(kDevice);
+  Check(free_restored.ok() && free_restored.value() && *free_restored.value() == with_free,
+        "free games filter round trips");
+  auto unknown_filter = with_free;
+  unknown_filter.filters.insert("controller-full");
+  Check(!store.Save(kDevice, unknown_filter).ok(), "an unknown filter is rejected");
+  auto v1_free = Example();
+  v1_free.schema_version = 1;
+  v1_free.filters = {"free"};
+  Check(!store.SaveV1(kFirstAccount, v1_free).ok(), "version 1 cannot hold the free games filter");
   auto v1_family = Example();
   v1_family.schema_version = 1;
   v1_family.filters = {"hide-family"};

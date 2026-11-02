@@ -1,6 +1,7 @@
 #include "library/cache.h"
 #include <cstdio>
 #include <cstdlib>
+#include <sys/stat.h>
 #include <unistd.h>
 #include "steam_id.h"
 using namespace playden;
@@ -96,6 +97,19 @@ int main(){
  auto lossy_tags=tagged;lossy_tags.schema_version=7;
  Check(!cache.Save("76561198000000008",lossy_tags).ok(),"schema seven cannot silently discard store tags");
  Check(!shared_restored.value().games[0].store_tags_known,"older schemas hold no store tags");
+ Check(!tagged_restored.value().games[0].free,"schema eight holds no free mark");
+ LibrarySnapshot free_games{9,123464,{{SteamId(90),"Free Game","","",""},{SteamId(91),"Owned Game","","",""},{SteamId(92),"Shared","","",""}}};
+ free_games.games[0].free=true;free_games.games[0].store_tags={"Free to Play"};free_games.games[0].store_tags_known=true;
+ free_games.games[2].family_shared=true;
+ Check(cache.Save("76561198000000009",free_games).ok(),"save schema nine free games");
+ auto free_restored=cache.Load("76561198000000009");
+ Check(free_restored.ok()&&free_restored.value().schema_version==9,"load schema nine");
+ Check(free_restored.value().games[0].free&&free_restored.value().games[0].store_tags_known&&
+     free_restored.value().games[0].store_tags.size()==1&&!free_restored.value().games[1].free&&
+     free_restored.value().games[2].family_shared&&!free_restored.value().games[2].free,"free mark roundtrip beside tags and family sharing");
+ auto lossy_free=free_games;lossy_free.schema_version=8;
+ Check(!cache.Save("76561198000000009",lossy_free).ok(),"schema eight cannot silently discard free games");
+ Check(!tagged_restored.value().games[0].free&&!shared_restored.value().games[0].free,"older schemas hold no free games");
  auto zero_dated=dated;zero_dated.games[0].added_at_unix_seconds=0;
  Check(!cache.Save("76561198000000005",zero_dated).ok(),"zero acquisition date rejected");
  auto future=partial;future.retrieved_at_unix_seconds=std::uint64_t{1}<<63;
@@ -108,6 +122,38 @@ int main(){
  Check(!stale_temporary.ok()&&stale_temporary.error()==StorageError::kNotFound,"clear removes interrupted replacement file");
  Check(cache.Clear("76561198000000004").ok(),"clearing an absent cache is idempotent");
  Check(!cache.Clear(std::uint64_t{0}).ok(),"zero account is rejected");
- std::remove((std::string(root)+"/library-76561198000000001.cache").c_str());std::remove((std::string(root)+"/library-76561198000000002.cache").c_str());std::remove((std::string(root)+"/library-76561198000000003.cache").c_str());rmdir(root);
+ LibrarySnapshot held{9,123465,{{SteamId(100),"Held","","",""},{SteamId(101),"Other","","",""}}};
+ Check(cache.Save("76561198000000010",held).ok(),"save library for tag merges");
+ Check(cache.MergeGameTags(76561198000000010ULL,{{SteamId(100),{"Roguelike"}}}).ok(),"merge tags that differ");
+ const auto merged_path=std::string(root)+"/library-76561198000000010.cache";
+ struct stat first_file{};
+ Check(stat(merged_path.c_str(),&first_file)==0,"stat the cache after a tag change");
+ Check(cache.MergeGameTags(76561198000000010ULL,{{SteamId(100),{"Roguelike"}}}).ok(),"merge the same tags again");
+ struct stat second_file{};
+ Check(stat(merged_path.c_str(),&second_file)==0,"stat the cache after an unchanged merge");
+ Check(first_file.st_ino==second_file.st_ino,"unchanged tags do not write");
+ auto merged_bytes=storage.Read("library-76561198000000010.cache");
+ Check(merged_bytes.ok(),"read the merged cache before damaging it");
+ auto damaged=merged_bytes.value();damaged[damaged.size()/2]^=1;
+ Check(storage.WriteAtomic("library-76561198000000010.cache",damaged).ok(),"damage the file under the resident snapshot");
+ Check(cache.MergeGameTags(76561198000000010ULL,{{SteamId(101),{"Indie"}}}).ok(),"a changed merge does not read the damaged file");
+ LibraryCache reread(storage);
+ auto both=reread.Load("76561198000000010");
+ Check(both.ok()&&both.value().games.size()==2,"changed tags were written from memory");
+ Check(both.value().games[0].store_tags_known&&both.value().games[0].store_tags.size()==1&&
+     both.value().games[0].store_tags[0]=="Roguelike","first game keeps its tags");
+ Check(both.value().games[1].store_tags_known&&both.value().games[1].store_tags.size()==1&&
+     both.value().games[1].store_tags[0]=="Indie","second game gained tags without a reload");
+ LibrarySnapshot refreshed{9,123466,{{SteamId(100),"Held renamed","","",""},{SteamId(102),"Newcomer","","",""}}};
+ Check(cache.Save("76561198000000010",refreshed).ok(),"library refresh replaces the snapshot");
+ LibraryCache after_refresh(storage);
+ auto kept=after_refresh.Load("76561198000000010");
+ Check(kept.ok()&&kept.value().games.size()==2,"refresh writes the new library");
+ Check(kept.value().games[0].title=="Held renamed"&&kept.value().games[0].store_tags_known&&
+     kept.value().games[0].store_tags.size()==1&&kept.value().games[0].store_tags[0]=="Roguelike",
+     "refresh keeps tags for a game that remains");
+ Check(kept.value().games[1].title=="Newcomer"&&!kept.value().games[1].store_tags_known,
+     "a new game has no tags and the dropped game is gone");
+ std::remove((std::string(root)+"/library-76561198000000001.cache").c_str());std::remove((std::string(root)+"/library-76561198000000002.cache").c_str());std::remove((std::string(root)+"/library-76561198000000003.cache").c_str());std::remove(merged_path.c_str());rmdir(root);
  puts("library_cache_test passed");
 }

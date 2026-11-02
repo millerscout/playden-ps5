@@ -8,8 +8,8 @@ namespace {
 constexpr std::size_t kMaximumCacheBytes = 16 * 1024 * 1024;
 constexpr std::size_t kMaximumGames = 100000;
 // Schema 5 names each game by store and value; 4 and older hold Steam app IDs only. 6 marks demos.
-// 7 family sharing. 8 persists user-defined Steam store tags.
-constexpr unsigned kLatestSchema = 8;
+// 7 family sharing. 8 persists user-defined Steam store tags. 9 marks license-only free games.
+constexpr unsigned kLatestSchema = 9;
 constexpr std::size_t kMaximumGameValue = 48;
 constexpr std::size_t kMaximumStoreTagBytes = 64;
 constexpr std::size_t kMaximumStoreTags = 32;
@@ -65,7 +65,7 @@ bool ValidGame(const GameSummary& game,unsigned schema) {
 }
 Result<void> Invalid(const char* message) {return Result<void>::Failure(StorageError::kInvalidData,message);}
 }
-Result<void> LibraryCache::Save(const std::string& account,const LibrarySnapshot& snapshot) const {
+Result<void> LibraryCache::Persist(const std::string& account,const LibrarySnapshot& snapshot) const {
     if(!ValidAccount(account))return Invalid("Invalid cache account identifier.");
     if((snapshot.schema_version<1||snapshot.schema_version>kLatestSchema)||snapshot.games.size()>kMaximumGames||
         snapshot.retrieved_at_unix_seconds>static_cast<std::uint64_t>(std::numeric_limits<std::int64_t>::max()))return Invalid("Unsupported library cache schema or size.");
@@ -83,12 +83,13 @@ Result<void> LibraryCache::Save(const std::string& account,const LibrarySnapshot
         if(snapshot.schema_version<6 && game.demo)return Invalid("Cache schema cannot preserve demos.");
         if(snapshot.schema_version<7 && game.family_shared)return Invalid("Cache schema cannot preserve family sharing.");
         if(snapshot.schema_version<8 && game.store_tags_known)return Invalid("Cache schema cannot preserve store tags.");
+        if(snapshot.schema_version<9 && game.free)return Invalid("Cache schema cannot preserve free games.");
         if(snapshot.schema_version>=5){Number(encoded,static_cast<std::uint8_t>(game.id.store),1);String(encoded,game.id.value);}
         else Number(encoded,*game.id.steam_app(),4);
         String(encoded,game.title);String(encoded,game.artwork_source);String(encoded,game.description);String(encoded,game.developer);
         if(snapshot.schema_version>=2){
             const auto flags=(game.playtime_minutes?1u:0u)|(game.last_played_unix_seconds?2u:0u)|(game.added_at_unix_seconds?4u:0u)|
-                (game.demo?8u:0u)|(game.family_shared?16u:0u)|(game.store_tags_known?32u:0u);
+                (game.demo?8u:0u)|(game.family_shared?16u:0u)|(game.store_tags_known?32u:0u)|(game.free?64u:0u);
             Number(encoded,flags,1);
             if(game.playtime_minutes)Number(encoded,*game.playtime_minutes,8);
             if(game.last_played_unix_seconds)Number(encoded,*game.last_played_unix_seconds,8);
@@ -135,7 +136,7 @@ Result<LibrarySnapshot> LibraryCache::Load(const std::string& account) const {
         game.artwork_source=reader.String(8192);game.description=reader.String(65536);game.developer=reader.String(4096);
         if(snapshot.schema_version>=2){
             const auto flags=reader.Number(1);
-            const auto max_flags=snapshot.schema_version>=8?63u:snapshot.schema_version>=7?31u:snapshot.schema_version>=6?15u:snapshot.schema_version>=4?7u:3u;
+            const auto max_flags=snapshot.schema_version>=9?127u:snapshot.schema_version>=8?63u:snapshot.schema_version>=7?31u:snapshot.schema_version>=6?15u:snapshot.schema_version>=4?7u:3u;
             if(flags>max_flags)return invalid();
             if(flags&1)game.playtime_minutes=reader.Number(8);
             if(flags&2)game.last_played_unix_seconds=reader.Number(8);
@@ -143,6 +144,7 @@ Result<LibrarySnapshot> LibraryCache::Load(const std::string& account) const {
             game.demo=(flags&8)!=0;
             game.family_shared=(flags&16)!=0;
             game.store_tags_known=(flags&32)!=0;
+            game.free=(flags&64)!=0;
             if(game.store_tags_known){
                 const auto tag_count=reader.Number(1);
                 if(!reader.okay||tag_count>kMaximumStoreTags)return invalid();
@@ -164,17 +166,38 @@ Result<LibrarySnapshot> LibraryCache::Load(std::uint64_t account) const {
     if(!account)return Result<LibrarySnapshot>::Failure(StorageError::kInvalidData,"Invalid cache account identifier.");
     return Load(std::to_string(account));
 }
+Result<void> LibraryCache::Save(const std::string& account,const LibrarySnapshot& snapshot) const {
+    if(!ValidAccount(account))return Invalid("Invalid cache account identifier.");
+    std::lock_guard<std::mutex> lock(snapshot_mutex_);
+    LibrarySnapshot written=snapshot;
+    if(resident_&&resident_account_==account){
+        for(auto& game:written.games){
+            const auto found=std::find_if(resident_->games.begin(),resident_->games.end(),
+                [&game](const GameSummary& kept){return kept.id==game.id;});
+            if(found==resident_->games.end()||!found->store_tags_known)continue;
+            game.store_tags=found->store_tags;
+            game.store_tags_known=true;
+        }
+    }
+    const auto saved=Persist(account,written);
+    if(!saved.ok())return saved;
+    resident_account_=account;
+    resident_=std::move(written);
+    return Result<void>::Success();
+}
 Result<void> LibraryCache::Save(std::uint64_t account,const LibrarySnapshot& snapshot) const {
     if(!account)return Invalid("Invalid cache account identifier.");
     return Save(std::to_string(account),snapshot);
 }
 Result<void> LibraryCache::Clear(const std::string& account) const {
     if(!ValidAccount(account))return Invalid("Invalid cache account identifier.");
+    std::lock_guard<std::mutex> lock(snapshot_mutex_);
     const auto path=Path(account);
     const auto final_result=storage_.Remove(path);
     const auto temporary_result=storage_.Remove(path+".tmp");
     if(!final_result.ok())return final_result;
     if(!temporary_result.ok())return temporary_result;
+    if(resident_account_==account){resident_.reset();resident_account_.clear();}
     return Result<void>::Success();
 }
 Result<void> LibraryCache::Clear(std::uint64_t account) const {
@@ -182,23 +205,63 @@ Result<void> LibraryCache::Clear(std::uint64_t account) const {
     return Clear(std::to_string(account));
 }
 
+Result<void> LibraryCache::MergeResident(
+    const std::string& account, const std::vector<std::pair<GameId, std::vector<std::string>>>& updates,
+    bool strict) const {
+    if (!ValidAccount(account)) return Invalid("Invalid cache account identifier.");
+    auto acceptable = [](const std::pair<GameId, std::vector<std::string>>& update) {
+        if (!update.first.valid() || update.second.size() > kMaximumStoreTags) return false;
+        return std::none_of(update.second.begin(), update.second.end(), [](const std::string& tag) {
+            return tag.empty() || tag.size() > kMaximumStoreTagBytes;
+        });
+    };
+    if (strict) {
+        if (updates.size() != 1 || !acceptable(updates.front())) return Invalid("Invalid game for tag merge.");
+    }
+    std::lock_guard<std::mutex> lock(snapshot_mutex_);
+    if (!resident_ || resident_account_ != account) {
+        auto loaded = Load(account);
+        if (!loaded.ok()) return Result<void>::Failure(loaded.error(), loaded.message());
+        resident_ = std::move(loaded.value());
+        resident_account_ = account;
+    }
+    struct Undo {
+        std::size_t index = 0;
+        std::vector<std::string> tags;
+        bool known = false;
+    };
+    std::vector<Undo> undo;
+    bool changed = false;
+    for (const auto& update : updates) {
+        if (!acceptable(update)) continue;
+        const auto found = std::find_if(resident_->games.begin(), resident_->games.end(),
+                                        [&update](const GameSummary& game) { return game.id == update.first; });
+        if (found == resident_->games.end()) continue;
+        if (found->store_tags_known && found->store_tags == update.second) continue;
+        undo.push_back({static_cast<std::size_t>(found - resident_->games.begin()), found->store_tags,
+                        found->store_tags_known});
+        found->store_tags = update.second;
+        found->store_tags_known = true;
+        changed = true;
+    }
+    if (!changed) return Result<void>::Success();
+    const auto previous_schema = resident_->schema_version;
+    resident_->schema_version = kLatestSchema;
+    const auto saved = Persist(account, *resident_);
+    if (!saved.ok()) {
+        resident_->schema_version = previous_schema;
+        for (auto restored = undo.rbegin(); restored != undo.rend(); ++restored) {
+            auto& game = resident_->games[restored->index];
+            game.store_tags = std::move(restored->tags);
+            game.store_tags_known = restored->known;
+        }
+        return saved;
+    }
+    return Result<void>::Success();
+}
 Result<void> LibraryCache::MergeGameTags(const std::string& account, const GameId& id,
                                          std::vector<std::string> tags) const {
-    if (!ValidAccount(account)) return Invalid("Invalid cache account identifier.");
-    if (!id.valid()) return Invalid("Invalid game for tag merge.");
-    if (tags.size() > kMaximumStoreTags) return Invalid("Too many store tags.");
-    for (const auto& tag : tags)
-        if (tag.empty() || tag.size() > kMaximumStoreTagBytes) return Invalid("Invalid store tag.");
-    auto loaded = Load(account);
-    if (!loaded.ok()) return Result<void>::Failure(loaded.error(), loaded.message());
-    auto snapshot = std::move(loaded.value());
-    snapshot.schema_version = kLatestSchema;
-    const auto found = std::find_if(snapshot.games.begin(), snapshot.games.end(),
-                                    [&id](const GameSummary& game) { return game.id == id; });
-    if (found == snapshot.games.end()) return Result<void>::Success();
-    found->store_tags = std::move(tags);
-    found->store_tags_known = true;
-    return Save(account, snapshot);
+    return MergeResident(account, {{id, std::move(tags)}}, true);
 }
 Result<void> LibraryCache::MergeGameTags(std::uint64_t account, const GameId& id,
                                          std::vector<std::string> tags) const {
@@ -208,27 +271,6 @@ Result<void> LibraryCache::MergeGameTags(std::uint64_t account, const GameId& id
 Result<void> LibraryCache::MergeGameTags(
     std::uint64_t account, const std::vector<std::pair<GameId, std::vector<std::string>>>& updates) const {
     if (!account) return Invalid("Invalid cache account identifier.");
-    auto loaded = Load(std::to_string(account));
-    if (!loaded.ok()) return Result<void>::Failure(loaded.error(), loaded.message());
-    auto snapshot = std::move(loaded.value());
-    bool changed = false;
-    for (const auto& update : updates) {
-        const GameId id = update.first;
-        const auto& tags = update.second;
-        if (!id.valid() || tags.size() > kMaximumStoreTags) continue;
-        if (std::any_of(tags.begin(), tags.end(), [](const std::string& tag) {
-              return tag.empty() || tag.size() > kMaximumStoreTagBytes;
-            }))
-            continue;
-        const auto found = std::find_if(snapshot.games.begin(), snapshot.games.end(),
-                                        [&id](const GameSummary& game) { return game.id == id; });
-        if (found == snapshot.games.end()) continue;
-        found->store_tags = tags;
-        found->store_tags_known = true;
-        changed = true;
-    }
-    if (!changed) return Result<void>::Success();
-    snapshot.schema_version = kLatestSchema;
-    return Save(std::to_string(account), snapshot);
+    return MergeResident(std::to_string(account), updates, false);
 }
 } // namespace playden

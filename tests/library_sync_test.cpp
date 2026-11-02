@@ -1,4 +1,5 @@
 #include "library/service.h"
+#include <algorithm>
 #include <atomic>
 #include <cassert>
 #include <chrono>
@@ -52,6 +53,40 @@ void RefreshKeepsABlockedLicenseRead(){Sessions s;Backend b;Cache c;b.result={Li
 // A library with demos is saved as schema 6, the first that can mark them; one without keeps the older schema.
 void DemosChooseTheCacheSchema(){Sessions s;Backend b;Cache c;LibraryService service(b,s,&c,[]{return std::uint64_t{2000};});service.Refresh(123,1);Until(service,LibraryEventKind::kComplete);{std::lock_guard<std::mutex>l(c.mutex);assert(c.snapshots[123].schema_version==4);}b.result.games[0].demo=true;service.Refresh(123,1);auto e=Until(service,LibraryEventKind::kComplete);assert(e.back().games[0].demo);std::lock_guard<std::mutex>l(c.mutex);assert(c.snapshots[123].schema_version==6&&c.snapshots[123].games[0].demo);}
 void AcquisitionDatesCarryForward(){Sessions s;Backend b;Cache c;auto cached=Snapshot(1);cached.games[0].added_at_unix_seconds=900;c.snapshots[123]=cached;LibraryService service(b,s,&c,[]{return std::uint64_t{2000};});service.Refresh(123,1);auto e=Until(service,LibraryEventKind::kComplete);assert(e.back().games[0].added_at_unix_seconds==900u);{std::lock_guard<std::mutex>l(c.mutex);assert(c.snapshots[123].games[0].added_at_unix_seconds==900u);}b.result.games[0].added_at_unix_seconds=1000;service.Refresh(123,1);e=Until(service,LibraryEventKind::kComplete);assert(e.back().games[0].added_at_unix_seconds==1000u);}
+// A refresh keeps games the owned list no longer returns. Those are free, unless a family member shares them.
+// A game GetOwnedGames does return is not free, even when the previous save said it was.
+void ARefreshKeepsLicenseGamesAsFree(){
+  Sessions s;Backend b;Cache c;
+  auto cached=Snapshot(1);
+  GameSummary license{SteamId(99),"Free title",{},{},{}};
+  cached.games.push_back(license);
+  GameSummary shared{SteamId(77),"Shared title",{},{},{}};
+  shared.family_shared=true;
+  cached.games.push_back(std::move(shared));
+  c.snapshots[123]=cached;
+  b.result={LibraryError::kNone,{{SteamId(42),"Fresh title",{},{},{},12,700}},false,false};
+  b.result.games[0].free=true;
+  LibraryService service(b,s,&c,[]{return std::uint64_t{2000};});
+  service.Refresh(123,1);
+  auto e=Until(service,LibraryEventKind::kComplete);
+  const auto& games=e.back().games;
+  assert(games.size()==3);
+  const auto find=[&](std::uint32_t app){return std::find_if(games.begin(),games.end(),[&](const GameSummary& game){return game.id==SteamId(app);});};
+  const auto owned=find(42), freed=find(99), family=find(77);
+  assert(owned!=games.end()&&!owned->free&&owned->title=="Fresh title");
+  assert(freed!=games.end()&&freed->free&&!freed->family_shared);
+  assert(family!=games.end()&&family->family_shared&&!family->free);
+  {std::lock_guard<std::mutex> l(c.mutex);assert(c.snapshots[123].schema_version==9&&c.snapshots[123].games.size()==3);}
+  b.result.games.push_back(license);
+  service.Refresh(123,1);
+  e=Until(service,LibraryEventKind::kComplete);
+  const auto& again=e.back().games;
+  assert(again.size()==3);
+  const auto now_owned=std::find_if(again.begin(),again.end(),[](const GameSummary& game){return game.id==SteamId(99);});
+  const auto still_shared=std::find_if(again.begin(),again.end(),[](const GameSummary& game){return game.id==SteamId(77);});
+  assert(now_owned!=again.end()&&!now_owned->free);
+  assert(still_shared!=again.end()&&still_shared->family_shared&&!still_shared->free);
+}
 // Only a library with a family-shared game needs schema 7; demos alone stay at 6 and plain libraries at 4.
 void FamilySharedGamesChooseTheCacheSchema(){Sessions s;Backend b;Cache c;LibraryService service(b,s,&c,[]{return std::uint64_t{2000};});b.result.games[0].demo=true;service.Refresh(123,1);Until(service,LibraryEventKind::kComplete);{std::lock_guard<std::mutex>l(c.mutex);assert(c.snapshots[123].schema_version==6);}b.result.games[0].demo=false;b.result.games[0].family_shared=true;service.Refresh(123,1);auto e=Until(service,LibraryEventKind::kComplete);assert(e.back().games[0].family_shared);{std::lock_guard<std::mutex>l(c.mutex);assert(c.snapshots[123].schema_version==7&&c.snapshots[123].games[0].family_shared);}b.result.games[0].family_shared=false;service.Refresh(123,1);Until(service,LibraryEventKind::kComplete);std::lock_guard<std::mutex>l(c.mutex);assert(c.snapshots[123].schema_version==4&&!c.snapshots[123].games[0].family_shared);}
-int main(){AcquisitionDatesCarryForward();DemosChooseTheCacheSchema();FamilySharedGamesChooseTheCacheSchema();CachedThenNetworkAndSave();OfflineCacheOnly();FailureAndSaveError();AccountSwitchDuringLoad();SessionIdentityPrecedesCache();ClearWaitsForSave();ClearFailureAndShutdown();ShutdownCancelsNetwork();GenerationsAndNoCache();OwnedGamesPublishBeforeLicenses();LicenseMissKeepsTheOwnedLibrary();RefreshSkipsLicensesUntilAsked();RefreshKeepsABlockedLicenseRead();}
+int main(){AcquisitionDatesCarryForward();DemosChooseTheCacheSchema();FamilySharedGamesChooseTheCacheSchema();ARefreshKeepsLicenseGamesAsFree();CachedThenNetworkAndSave();OfflineCacheOnly();FailureAndSaveError();AccountSwitchDuringLoad();SessionIdentityPrecedesCache();ClearWaitsForSave();ClearFailureAndShutdown();ShutdownCancelsNetwork();GenerationsAndNoCache();OwnedGamesPublishBeforeLicenses();LicenseMissKeepsTheOwnedLibrary();RefreshSkipsLicensesUntilAsked();RefreshKeepsABlockedLicenseRead();}

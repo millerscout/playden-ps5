@@ -20,6 +20,9 @@ struct GameSummary {
     bool demo = false;
     // Shared by another member of the account's Steam family, not owned; the Library marks it.
     bool family_shared = false;
+    // In the library only because of a license, not in GetOwnedGames. The Library hides these until
+    // Free games is on. A family-shared game is not also free.
+    bool free = false;
     // User-defined Steam store tags; known only after enrichment or opening Details with store data.
     std::vector<std::string> store_tags;
     bool store_tags_known = false;

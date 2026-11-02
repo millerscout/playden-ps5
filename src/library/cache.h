@@ -1,5 +1,7 @@
 #pragma once
 #include "library/repository.h"
+#include <mutex>
+#include <optional>
 #include <string>
 #include <utility>
 #include <vector>
@@ -18,11 +20,20 @@ class LibraryCache final : public LibraryRepository {
                              std::vector<std::string> tags) const;
   Result<void> MergeGameTags(std::uint64_t account_id, const GameId& id,
                              std::vector<std::string> tags) const;
-  // One read and one write for several games. A game that is missing or whose tags are not valid is skipped.
+  // Patches the snapshot kept for this account. The file is read only when that snapshot is missing,
+  // and written when a game's tags differ. A missing game, or tags that are not valid, is skipped.
   Result<void> MergeGameTags(std::uint64_t account_id,
                              const std::vector<std::pair<GameId, std::vector<std::string>>>& updates) const;
 
  private:
+  Result<void> Persist(const std::string& account, const LibrarySnapshot& snapshot) const;
+  Result<void> MergeResident(
+      const std::string& account,
+      const std::vector<std::pair<GameId, std::vector<std::string>>>& updates, bool strict) const;
+
   Storage& storage_;
+  mutable std::mutex snapshot_mutex_;
+  mutable std::optional<LibrarySnapshot> resident_;
+  mutable std::string resident_account_;
 };
 }  // namespace playden

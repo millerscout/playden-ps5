@@ -202,6 +202,7 @@ GameSummary LicensedGame(std::uint32_t app, const AppName& name, bool shared,
   GameSummary game{GameId::Steam(app), name.name, {}, {}, {}};
   game.demo = name.kind == AppName::Kind::kDemo;
   game.family_shared = shared;
+  game.free = !shared;
   if (!name.icon.empty())
     game.artwork_source = "https://media.steampowered.com/steamcommunity/public/images/apps/" + std::to_string(app) +
                           "/" + name.icon + ".jpg";

@@ -13,8 +13,9 @@ constexpr std::size_t kMaximumEvents = 64;
 constexpr std::uint64_t kMaximumTimestamp =
     static_cast<std::uint64_t>(std::numeric_limits<std::int64_t>::max());
 
-// Only a library with demos needs schema 6, one with family-shared games schema 7, and one with known
-// store tags schema 8; one without stays readable by older versions.
+// Only a library with demos needs schema 6, one with family-shared games schema 7, one with known
+// store tags schema 8, and one with license-only free games schema 9; one without stays readable
+// by older versions.
 void SetSchema(LibrarySnapshot* snapshot) {
   const auto& games = snapshot->games;
   if (std::any_of(games.begin(), games.end(), [](const GameSummary& game) { return game.demo; }))
@@ -23,6 +24,8 @@ void SetSchema(LibrarySnapshot* snapshot) {
     snapshot->schema_version = 7;
   if (std::any_of(games.begin(), games.end(), [](const GameSummary& game) { return game.store_tags_known; }))
     snapshot->schema_version = 8;
+  if (std::any_of(games.begin(), games.end(), [](const GameSummary& game) { return game.free; }))
+    snapshot->schema_version = 9;
 }
 
 }  // namespace
@@ -349,6 +352,20 @@ void LibraryService::ExecuteRefresh(const Job& job) {
     LibrarySnapshot snapshot;
     snapshot.retrieved_at_unix_seconds = Now();
     snapshot.games = std::move(result.games);
+    // GetOwnedGames is the owned list. Games saved from licenses stay, and are free unless a family
+    // member shares them. A game in this list is owned, so it is not free.
+    std::unordered_set<GameId> listed;
+    listed.reserve(snapshot.games.size() + previous_by_id.size());
+    for (auto& game : snapshot.games) {
+      game.free = false;
+      listed.insert(game.id);
+    }
+    for (const auto& [id, cached] : previous_by_id) {
+      if (!listed.insert(id).second) continue;
+      auto kept = cached;
+      kept.free = !kept.family_shared;
+      snapshot.games.push_back(std::move(kept));
+    }
     for (auto& game : snapshot.games) {
       if (game.added_at_unix_seconds) {
         /* keep */

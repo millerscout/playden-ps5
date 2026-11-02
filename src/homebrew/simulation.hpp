@@ -573,6 +573,7 @@ struct Game {
     GameUpdate update;  // from Steam app info, for an installed game
     bool demo = false;  // a Steam demo; Sort and filters › Demos hides it
     bool family_shared = false;  // shared by a Steam family member; the tile says "Family"
+    bool free = false;            // license-only; hidden until Sort and filters › Free games is on
     bool art_pending = false;
     bool art_failed = false;
 };

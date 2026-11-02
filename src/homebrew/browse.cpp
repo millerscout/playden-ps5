@@ -172,6 +172,9 @@ std::vector<const Game*> filtered_games(const State& state)
             continue;
         if (state.library.filters.contains("hide-family") && game.family_shared)
             continue;
+        // License-only free games stay out of the grid until the player turns Free games on.
+        if (game.free && !state.library.filters.contains("free"))
+            continue;
         if (state.library.filters.contains("genre-adventure") &&
             std::find(game.genres.begin(), game.genres.end(), "Adventure") == game.genres.end())
             continue;
